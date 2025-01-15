@@ -1,216 +1,178 @@
-use crate::{DynAbiError, DynAbiResult, DynSolType, DynSolValue, Word};
+use crate::{DynSolType, DynSolValue, Error, Result, Word};
 use alloc::{
-    boxed::Box,
     string::{String, ToString},
     vec::Vec,
 };
-use alloy_primitives::{Address, I256, U256};
+use alloy_primitives::{Address, Function, I256, U256};
 
 impl DynSolType {
     /// Coerce a [`serde_json::Value`] to a [`DynSolValue`] via this type.
-    pub fn coerce(&self, value: &serde_json::Value) -> DynAbiResult<DynSolValue> {
+    pub fn coerce_json(&self, value: &serde_json::Value) -> Result<DynSolValue> {
+        let err = || Error::eip712_coerce(self, value);
         match self {
-            DynSolType::Address => address(value),
-            DynSolType::Bool => bool(value),
-            DynSolType::Int(n) => int(*n, value),
-            DynSolType::Uint(n) => uint(*n, value),
-            DynSolType::FixedBytes(n) => fixed_bytes(*n, value),
-            DynSolType::String => string(value),
-            DynSolType::Bytes => bytes(value),
-            DynSolType::Array(inner) => array(inner, value),
-            DynSolType::FixedArray(inner, n) => fixed_array(inner, *n, value),
-            DynSolType::Tuple(inner) => tuple(inner, value),
-            DynSolType::CustomStruct {
-                name,
-                prop_names,
-                tuple,
-            } => coerce_custom_struct(name, prop_names, tuple, value),
+            Self::Bool
+            | Self::Int(_)
+            | Self::Uint(_)
+            | Self::FixedBytes(_)
+            | Self::Address
+            | Self::Function
+            | Self::String
+            | Self::Bytes => self.coerce_json_simple(value).ok_or_else(err),
+
+            Self::Array(inner) => array(inner, value)
+                .ok_or_else(err)
+                .and_then(core::convert::identity)
+                .map(DynSolValue::Array),
+            Self::FixedArray(inner, n) => fixed_array(inner, *n, value)
+                .ok_or_else(err)
+                .and_then(core::convert::identity)
+                .map(DynSolValue::FixedArray),
+            Self::Tuple(inner) => tuple(inner, value)
+                .ok_or_else(err)
+                .and_then(core::convert::identity)
+                .map(DynSolValue::Tuple),
+            Self::CustomStruct { name, prop_names, tuple } => {
+                custom_struct(name, prop_names, tuple, value)
+            }
+        }
+    }
+
+    fn coerce_json_simple(&self, value: &serde_json::Value) -> Option<DynSolValue> {
+        match self {
+            Self::Bool => bool(value).map(DynSolValue::Bool),
+            &Self::Int(n) => int(n, value).map(|x| DynSolValue::Int(x, n)),
+            &Self::Uint(n) => uint(n, value).map(|x| DynSolValue::Uint(x, n)),
+            &Self::FixedBytes(n) => fixed_bytes(n, value).map(|x| DynSolValue::FixedBytes(x, n)),
+            Self::Address => address(value).map(DynSolValue::Address),
+            Self::Function => function(value).map(DynSolValue::Function),
+            Self::String => string(value).map(DynSolValue::String),
+            Self::Bytes => bytes(value).map(DynSolValue::Bytes),
+            _ => unreachable!(),
         }
     }
 }
 
-fn address(value: &serde_json::Value) -> DynAbiResult<DynSolValue> {
-    let address = value
-        .as_str()
-        .map(|s| {
-            s.parse::<Address>()
-                .map_err(|_| DynAbiError::type_mismatch(DynSolType::Address, value))
-        })
-        .ok_or_else(|| DynAbiError::type_mismatch(DynSolType::Address, value))??;
-
-    Ok(DynSolValue::Address(address))
+fn bool(value: &serde_json::Value) -> Option<bool> {
+    value.as_bool().or_else(|| value.as_str().and_then(|s| s.parse().ok()))
 }
 
-fn bool(value: &serde_json::Value) -> DynAbiResult<DynSolValue> {
-    if let Some(bool) = value.as_bool() {
-        return Ok(DynSolValue::Bool(bool))
-    }
-
-    let bool = value
-        .as_str()
-        .map(|s| {
-            s.parse::<bool>()
-                .map_err(|_| DynAbiError::type_mismatch(DynSolType::Address, value))
-        })
-        .ok_or_else(|| DynAbiError::type_mismatch(DynSolType::Address, value))??;
-    Ok(DynSolValue::Bool(bool))
-}
-
-fn int(n: usize, value: &serde_json::Value) -> DynAbiResult<DynSolValue> {
-    if let Some(num) = value.as_i64() {
-        return Ok(DynSolValue::Int(I256::try_from(num).unwrap(), n))
-    }
-
-    if let Some(Ok(i)) = value.as_str().map(|s| s.parse()) {
-        return Ok(DynSolValue::Int(i, n))
-    }
-
-    Err(DynAbiError::type_mismatch(DynSolType::Int(n), value))
-}
-
-fn uint(n: usize, value: &serde_json::Value) -> DynAbiResult<DynSolValue> {
-    if let Some(num) = value.as_u64() {
-        return Ok(DynSolValue::Uint(U256::from(num), n))
-    }
-
-    if let Some(s) = value.as_str() {
-        let s = s.strip_prefix("0x").unwrap_or(s);
-        if let Ok(int) = U256::from_str_radix(s, 10) {
-            return Ok(DynSolValue::Uint(int, n))
+fn int(n: usize, value: &serde_json::Value) -> Option<I256> {
+    (|| {
+        if let Some(num) = value.as_i64() {
+            return Some(I256::try_from(num).unwrap());
         }
-        if let Ok(int) = U256::from_str_radix(s, 16) {
-            return Ok(DynSolValue::Uint(int, n))
-        }
-    }
-
-    Err(DynAbiError::type_mismatch(DynSolType::Uint(n), value))
+        value.as_str().and_then(|s| s.parse().ok())
+    })()
+    .and_then(|x| (x.bits() <= n as u32).then_some(x))
 }
 
-fn fixed_bytes(n: usize, value: &serde_json::Value) -> DynAbiResult<DynSolValue> {
+fn uint(n: usize, value: &serde_json::Value) -> Option<U256> {
+    (|| {
+        if let Some(num) = value.as_u64() {
+            return Some(U256::from(num));
+        }
+        value.as_str().and_then(|s| s.parse().ok())
+    })()
+    .and_then(|x| (x.bit_len() <= n).then_some(x))
+}
+
+fn fixed_bytes(n: usize, value: &serde_json::Value) -> Option<Word> {
     if let Some(Ok(buf)) = value.as_str().map(hex::decode) {
-        let mut word: Word = Default::default();
+        let mut word = Word::ZERO;
         let min = n.min(buf.len());
-        word[..min].copy_from_slice(&buf[..min]);
-        return Ok(DynSolValue::FixedBytes(word, n))
-    }
-
-    Err(DynAbiError::type_mismatch(DynSolType::FixedBytes(n), value))
-}
-
-fn string(value: &serde_json::Value) -> DynAbiResult<DynSolValue> {
-    let string = value
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| DynAbiError::type_mismatch(DynSolType::String, value))?;
-    Ok(DynSolValue::String(string))
-}
-
-fn bytes(value: &serde_json::Value) -> DynAbiResult<DynSolValue> {
-    let bytes = value
-        .as_str()
-        .map(|s| hex::decode(s).map_err(|_| DynAbiError::type_mismatch(DynSolType::Bytes, value)))
-        .ok_or_else(|| DynAbiError::type_mismatch(DynSolType::Bytes, value))??;
-    Ok(DynSolValue::Bytes(bytes))
-}
-
-fn tuple(inner: &[DynSolType], value: &serde_json::Value) -> DynAbiResult<DynSolValue> {
-    if let Some(arr) = value.as_array() {
-        if inner.len() != arr.len() {
-            return Err(DynAbiError::type_mismatch(
-                DynSolType::Tuple(inner.to_vec()),
-                value,
-            ))
+        if min <= 32 {
+            word[..min].copy_from_slice(&buf[..min]);
+            return Some(word);
         }
-
-        let tuple = arr
-            .iter()
-            .zip(inner.iter())
-            .map(|(v, t)| t.coerce(v))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        return Ok(DynSolValue::Tuple(tuple))
     }
-
-    Err(DynAbiError::type_mismatch(
-        DynSolType::Tuple(inner.to_vec()),
-        value,
-    ))
+    None
 }
 
-fn array(inner: &DynSolType, value: &serde_json::Value) -> DynAbiResult<DynSolValue> {
-    if let Some(arr) = value.as_array() {
-        let array = arr
-            .iter()
-            .map(|v| inner.coerce(v))
-            .collect::<Result<Vec<_>, _>>()?;
+fn address(value: &serde_json::Value) -> Option<Address> {
+    value.as_str().and_then(|s| s.parse().ok())
+}
 
-        return Ok(DynSolValue::Array(array))
+fn function(value: &serde_json::Value) -> Option<Function> {
+    value.as_str().and_then(|s| s.parse().ok())
+}
+
+fn string(value: &serde_json::Value) -> Option<String> {
+    value.as_str().map(|s| s.to_string())
+}
+
+fn bytes(value: &serde_json::Value) -> Option<Vec<u8>> {
+    if let Some(s) = value.as_str() {
+        return hex::decode(s).ok();
     }
 
-    Err(DynAbiError::type_mismatch(
-        DynSolType::Array(Box::new(inner.clone())),
-        value,
-    ))
+    let arr = value.as_array()?;
+    let mut vec = Vec::with_capacity(arr.len());
+    for elem in arr.iter() {
+        vec.push(elem.as_u64()?.try_into().ok()?);
+    }
+    Some(vec)
+}
+
+fn tuple(inner: &[DynSolType], value: &serde_json::Value) -> Option<Result<Vec<DynSolValue>>> {
+    if let Some(arr) = value.as_array() {
+        if inner.len() == arr.len() {
+            return Some(core::iter::zip(arr, inner).map(|(v, t)| t.coerce_json(v)).collect());
+        }
+    }
+    None
+}
+
+fn array(inner: &DynSolType, value: &serde_json::Value) -> Option<Result<Vec<DynSolValue>>> {
+    if let Some(arr) = value.as_array() {
+        return Some(arr.iter().map(|v| inner.coerce_json(v)).collect());
+    }
+    None
 }
 
 fn fixed_array(
     inner: &DynSolType,
     n: usize,
     value: &serde_json::Value,
-) -> DynAbiResult<DynSolValue> {
+) -> Option<Result<Vec<DynSolValue>>> {
     if let Some(arr) = value.as_array() {
-        if arr.len() != n {
-            return Err(DynAbiError::type_mismatch(
-                DynSolType::FixedArray(Box::new(inner.clone()), n),
-                value,
-            ))
+        if arr.len() == n {
+            return Some(arr.iter().map(|v| inner.coerce_json(v)).collect());
         }
-
-        let array = arr
-            .iter()
-            .map(|v| inner.coerce(v))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        return Ok(DynSolValue::FixedArray(array))
     }
-
-    Err(DynAbiError::type_mismatch(
-        DynSolType::FixedArray(Box::new(inner.clone()), n),
-        value,
-    ))
+    None
 }
 
-pub(crate) fn coerce_custom_struct(
+pub(crate) fn custom_struct(
     name: &str,
     prop_names: &[String],
     inner: &[DynSolType],
     value: &serde_json::Value,
-) -> Result<DynSolValue, DynAbiError> {
+) -> Result<DynSolValue> {
     if let Some(map) = value.as_object() {
         let mut tuple = vec![];
-        for (name, ty) in prop_names.iter().zip(inner.iter()) {
+        for (name, ty) in core::iter::zip(prop_names, inner) {
             if let Some(v) = map.get(name) {
-                tuple.push(ty.coerce(v)?);
+                tuple.push(ty.coerce_json(v)?);
             } else {
-                return Err(DynAbiError::type_mismatch(
-                    DynSolType::CustomStruct {
+                return Err(Error::eip712_coerce(
+                    &DynSolType::CustomStruct {
                         name: name.to_string(),
                         prop_names: prop_names.to_vec(),
                         tuple: inner.to_vec(),
                     },
                     value,
-                ))
+                ));
             }
         }
         return Ok(DynSolValue::CustomStruct {
             name: name.to_string(),
             prop_names: prop_names.to_vec(),
             tuple,
-        })
+        });
     }
 
-    Err(DynAbiError::type_mismatch(
-        DynSolType::CustomStruct {
+    Err(Error::eip712_coerce(
+        &DynSolType::CustomStruct {
             name: name.to_string(),
             prop_names: prop_names.to_vec(),
             tuple: inner.to_vec(),
@@ -224,6 +186,13 @@ mod tests {
     use super::*;
     use alloc::{borrow::ToOwned, string::ToString};
     use serde_json::json;
+
+    #[test]
+    fn test_bytes_num_array() {
+        let ty = DynSolType::Bytes;
+        let j = json!([1, 2, 3, 4]);
+        assert_eq!(ty.coerce_json(&j), Ok(DynSolValue::Bytes(vec![1, 2, 3, 4])));
+    }
 
     #[test]
     fn it_coerces() {
@@ -275,8 +244,8 @@ mod tests {
         let top = j.as_object().unwrap().get("message").unwrap();
 
         assert_eq!(
-            ty.coerce(top).unwrap(),
-            DynSolValue::CustomStruct {
+            ty.coerce_json(top),
+            Ok(DynSolValue::CustomStruct {
                 name: "Message".to_owned(),
                 prop_names: vec!["contents".to_string(), "from".to_string(), "to".to_string()],
                 tuple: vec![
@@ -288,14 +257,10 @@ mod tests {
                             DynSolValue::String("Cow".to_string()),
                             vec![
                                 DynSolValue::Address(
-                                    "0xCD2a3d9F938E13CD947Ec05AbC7FE734Df8DD826"
-                                        .parse()
-                                        .unwrap()
+                                    "0xCD2a3d9F938E13CD947Ec05AbC7FE734Df8DD826".parse().unwrap()
                                 ),
                                 DynSolValue::Address(
-                                    "0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF"
-                                        .parse()
-                                        .unwrap()
+                                    "0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF".parse().unwrap()
                                 ),
                             ]
                             .into()
@@ -308,19 +273,13 @@ mod tests {
                             DynSolValue::String("Bob".to_string()),
                             vec![
                                 DynSolValue::Address(
-                                    "0xbBbBBBBbbBBBbbbBbbBbbbbBBbBbbbbBbBbbBBbB"
-                                        .parse()
-                                        .unwrap()
+                                    "0xbBbBBBBbbBBBbbbBbbBbbbbBBbBbbbbBbBbbBBbB".parse().unwrap()
                                 ),
                                 DynSolValue::Address(
-                                    "0xB0BdaBea57B0BDABeA57b0bdABEA57b0BDabEa57"
-                                        .parse()
-                                        .unwrap()
+                                    "0xB0BdaBea57B0BDABeA57b0bdABEA57b0BDabEa57".parse().unwrap()
                                 ),
                                 DynSolValue::Address(
-                                    "0xB0B0b0b0b0b0B000000000000000000000000000"
-                                        .parse()
-                                        .unwrap()
+                                    "0xB0B0b0b0b0b0B000000000000000000000000000".parse().unwrap()
                                 ),
                             ]
                             .into()
@@ -328,7 +287,7 @@ mod tests {
                     }]
                     .into()
                 ]
-            }
-        )
+            })
+        );
     }
 }

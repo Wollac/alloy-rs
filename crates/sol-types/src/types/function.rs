@@ -1,18 +1,22 @@
-use crate::{token::TokenSeq, Encodable, Result, SolType, TokenType, Word};
+use crate::{
+    abi::{Token, TokenSeq},
+    private::SolTypeValue,
+    Result, SolType, Word,
+};
 use alloc::vec::Vec;
 
-/// Solidity call (a tuple with a selector).
+/// A Solidity function call.
 ///
-/// ### Implementer's Guide
+/// # Implementer's Guide
 ///
-/// We do not recommend implementing this trait directly. Instead, we recommend
-/// using the [`sol`][crate::sol] proc macro to parse a Solidity function
-/// definition.
+/// It should not be necessary to implement this trait manually. Instead, use
+/// the [`sol!`](crate::sol!) procedural macro to parse Solidity syntax into
+/// types that implement this trait.
 pub trait SolCall: Sized {
     /// The underlying tuple type which represents this type's arguments.
     ///
     /// If this type has no arguments, this will be the unit type `()`.
-    type Arguments<'a>: SolType<TokenType<'a> = Self::Token<'a>>;
+    type Parameters<'a>: SolType<Token<'a> = Self::Token<'a>>;
 
     /// The arguments' corresponding [TokenSeq] type.
     type Token<'a>: TokenSeq<'a>;
@@ -23,7 +27,7 @@ pub trait SolCall: Sized {
     /// The underlying tuple type which represents this type's return values.
     ///
     /// If this type has no return values, this will be the unit type `()`.
-    type ReturnTuple<'a>: SolType<TokenType<'a> = Self::ReturnToken<'a>>;
+    type ReturnTuple<'a>: SolType<Token<'a> = Self::ReturnToken<'a>>;
 
     /// The returns' corresponding [TokenSeq] type.
     type ReturnToken<'a>: TokenSeq<'a>;
@@ -35,63 +39,100 @@ pub trait SolCall: Sized {
     const SELECTOR: [u8; 4];
 
     /// Convert from the tuple type used for ABI encoding and decoding.
-    fn new(tuple: <Self::Arguments<'_> as SolType>::RustType) -> Self;
+    fn new(tuple: <Self::Parameters<'_> as SolType>::RustType) -> Self;
 
     /// Tokenize the call's arguments.
     fn tokenize(&self) -> Self::Token<'_>;
 
     /// The size of the encoded data in bytes, **without** its selector.
     #[inline]
-    fn encoded_size(&self) -> usize {
-        if let Some(size) = <Self::Arguments<'_> as SolType>::ENCODED_SIZE {
-            return size
+    fn abi_encoded_size(&self) -> usize {
+        if let Some(size) = <Self::Parameters<'_> as SolType>::ENCODED_SIZE {
+            return size;
         }
 
-        self.tokenize().total_words() * Word::len_bytes()
+        // `total_words` includes the first dynamic offset which we ignore.
+        let offset = <<Self::Parameters<'_> as SolType>::Token<'_> as Token>::DYNAMIC as usize * 32;
+        (self.tokenize().total_words() * Word::len_bytes()).saturating_sub(offset)
     }
 
     /// ABI decode this call's arguments from the given slice, **without** its
     /// selector.
     #[inline]
-    fn decode_raw(data: &[u8], validate: bool) -> Result<Self> {
-        <Self::Arguments<'_> as SolType>::decode(data, validate).map(Self::new)
+    fn abi_decode_raw(data: &[u8], validate: bool) -> Result<Self> {
+        <Self::Parameters<'_> as SolType>::abi_decode_sequence(data, validate).map(Self::new)
     }
 
     /// ABI decode this call's arguments from the given slice, **with** the
     /// selector.
     #[inline]
-    fn decode(data: &[u8], validate: bool) -> Result<Self> {
+    fn abi_decode(data: &[u8], validate: bool) -> Result<Self> {
         let data = data
             .strip_prefix(&Self::SELECTOR)
             .ok_or_else(|| crate::Error::type_check_fail_sig(data, Self::SIGNATURE))?;
-        Self::decode_raw(data, validate)
+        Self::abi_decode_raw(data, validate)
     }
 
     /// ABI encode the call to the given buffer **without** its selector.
     #[inline]
-    fn encode_raw(&self, out: &mut Vec<u8>) {
-        out.reserve(self.encoded_size());
-        out.extend(crate::encode(&self.tokenize()));
+    fn abi_encode_raw(&self, out: &mut Vec<u8>) {
+        out.reserve(self.abi_encoded_size());
+        out.extend(crate::abi::encode_sequence(&self.tokenize()));
     }
 
     /// ABI encode the call to the given buffer **with** its selector.
     #[inline]
-    fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + self.encoded_size());
+    fn abi_encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.abi_encoded_size());
         out.extend(&Self::SELECTOR);
-        self.encode_raw(&mut out);
+        self.abi_encode_raw(&mut out);
         out
     }
 
     /// ABI decode this call's return values from the given slice.
-    fn decode_returns(data: &[u8], validate: bool) -> Result<Self::Return>;
+    fn abi_decode_returns(data: &[u8], validate: bool) -> Result<Self::Return>;
 
     /// ABI encode the call's return values.
     #[inline]
-    fn encode_returns<'a, E>(e: &'a E) -> Vec<u8>
+    fn abi_encode_returns<'a, E>(e: &'a E) -> Vec<u8>
     where
-        E: Encodable<Self::ReturnTuple<'a>>,
+        E: SolTypeValue<Self::ReturnTuple<'a>>,
     {
-        crate::encode(&e.to_tokens())
+        crate::abi::encode_sequence(&e.stv_to_tokens())
+    }
+}
+
+/// A Solidity constructor.
+pub trait SolConstructor: Sized {
+    /// The underlying tuple type which represents this type's arguments.
+    ///
+    /// If this type has no arguments, this will be the unit type `()`.
+    type Parameters<'a>: SolType<Token<'a> = Self::Token<'a>>;
+
+    /// The arguments' corresponding [TokenSeq] type.
+    type Token<'a>: TokenSeq<'a>;
+
+    /// Convert from the tuple type used for ABI encoding and decoding.
+    fn new(tuple: <Self::Parameters<'_> as SolType>::RustType) -> Self;
+
+    /// Tokenize the call's arguments.
+    fn tokenize(&self) -> Self::Token<'_>;
+
+    /// The size of the encoded data in bytes.
+    #[inline]
+    fn abi_encoded_size(&self) -> usize {
+        if let Some(size) = <Self::Parameters<'_> as SolType>::ENCODED_SIZE {
+            return size;
+        }
+
+        // `total_words` includes the first dynamic offset which we ignore.
+        let offset = <<Self::Parameters<'_> as SolType>::Token<'_> as Token>::DYNAMIC as usize * 32;
+        (self.tokenize().total_words() * Word::len_bytes()).saturating_sub(offset)
+    }
+
+    /// ABI encode the call to the given buffer.
+    #[inline]
+    fn abi_encode(&self) -> Vec<u8> {
+        crate::abi::encode_sequence(&self.tokenize())
     }
 }

@@ -15,12 +15,23 @@ exclude.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
+rustdoc-args = [
+    "-Zunstable-options",
+    "--generate-link-to-definition",
+    "--show-type-layout",
+]
+
+[lints]
+workspace = true
 
 [dependencies]
+paste.workspace = true
 proc-macro2.workspace = true
 quote.workspace = true
 syn = { workspace = true, features = ["extra-traits"] }
+
+[dev-dependencies]
+pretty_assertions.workspace = true
 
 [features]
 visit = []

@@ -1,4 +1,4 @@
-use crate::{sol_data::*, token::WordToken, SolType};
+use crate::{abi::token::WordToken, sol_data::*, SolType};
 use alloc::vec::Vec;
 use alloy_primitives::keccak256;
 
@@ -10,6 +10,12 @@ use alloy_primitives::keccak256;
 /// For more details, see the [Solidity reference][ref].
 ///
 /// [ref]: https://docs.soliditylang.org/en/latest/abi-spec.html#encoding-of-indexed-event-parameters
+///
+/// # Implementer's Guide
+///
+/// It should not be necessary to implement this trait manually. Instead, use
+/// the [`sol!`](crate::sol!) procedural macro to parse Solidity syntax into
+/// types that implement this trait.
 pub trait EventTopic: SolType {
     /// The number of bytes this type occupies in another topic's preimage,
     /// usually a multiple of 32.
@@ -31,7 +37,8 @@ pub trait EventTopic: SolType {
     /// Indexed event parameter encoding.
     ///
     /// Note that this is different from [`encode_topic_preimage`] and
-    /// [`SolType::encode`]. See the [Solidity ABI spec][ref] for more details.
+    /// [`SolType::abi_encode`]. See the [Solidity ABI spec][ref] for more
+    /// details.
     ///
     /// [`encode_topic_preimage`]: EventTopic::encode_topic_preimage
     /// [ref]: https://docs.soliditylang.org/en/latest/abi-spec.html#encoding-of-indexed-event-parameters
@@ -40,7 +47,7 @@ pub trait EventTopic: SolType {
 
 // Single word types: encoded as just the single word
 macro_rules! word_impl {
-    ($t:ty) => {
+    () => {
         #[inline]
         fn topic_preimage_length(_: &Self::RustType) -> usize {
             32
@@ -48,48 +55,52 @@ macro_rules! word_impl {
 
         #[inline]
         fn encode_topic_preimage(rust: &Self::RustType, out: &mut Vec<u8>) {
-            out.extend($crate::Encodable::<$t>::to_tokens(rust).0 .0);
+            out.extend($crate::private::SolTypeValue::<Self>::stv_to_tokens(rust).0);
         }
 
         #[inline]
         fn encode_topic(rust: &Self::RustType) -> WordToken {
-            $crate::Encodable::<$t>::to_tokens(rust)
+            $crate::private::SolTypeValue::<Self>::stv_to_tokens(rust)
         }
     };
 }
 
 impl EventTopic for Address {
-    word_impl!(Address);
+    word_impl!();
+}
+
+impl EventTopic for Function {
+    word_impl!();
 }
 
 impl EventTopic for Bool {
-    word_impl!(Bool);
+    word_impl!();
 }
 
 impl<const BITS: usize> EventTopic for Int<BITS>
 where
     IntBitCount<BITS>: SupportedInt,
 {
-    word_impl!(Int<BITS>);
+    word_impl!();
 }
 
 impl<const BITS: usize> EventTopic for Uint<BITS>
 where
     IntBitCount<BITS>: SupportedInt,
 {
-    word_impl!(Uint<BITS>);
+    word_impl!();
 }
 
 impl<const N: usize> EventTopic for FixedBytes<N>
 where
     ByteCount<N>: SupportedFixedBytes,
 {
-    word_impl!(FixedBytes<N>);
+    word_impl!();
 }
 
 // Bytes-like types - preimage encoding: bytes padded to 32; hash: the bytes
 macro_rules! bytes_impl {
-    ($t:ty) => {
+    () => {
         #[inline]
         fn topic_preimage_length(rust: &Self::RustType) -> usize {
             crate::utils::next_multiple_of_32(rust.len())
@@ -108,26 +119,26 @@ macro_rules! bytes_impl {
 }
 
 impl EventTopic for String {
-    bytes_impl!(String);
+    bytes_impl!();
 }
 
 impl EventTopic for Bytes {
-    bytes_impl!(Bytes);
+    bytes_impl!();
 }
 
 // Complex types - preimage encoding and hash: iter each element
 macro_rules! array_impl {
-    ($T:ident) => {
+    ($ty:ident) => {
         #[inline]
         fn topic_preimage_length(rust: &Self::RustType) -> usize {
-            rust.iter().map($T::topic_preimage_length).sum()
+            rust.iter().map($ty::topic_preimage_length).sum()
         }
 
         #[inline]
         fn encode_topic_preimage(rust: &Self::RustType, out: &mut Vec<u8>) {
             out.reserve(Self::topic_preimage_length(rust));
             for t in rust {
-                $T::encode_topic_preimage(t, out);
+                $ty::encode_topic_preimage(t, out);
             }
         }
 
@@ -149,21 +160,21 @@ impl<T: EventTopic, const N: usize> EventTopic for FixedArray<T, N> {
 }
 
 macro_rules! tuple_impls {
-    ($($t:ident),+) => {
+    ($count:literal $($ty:ident),+) => {
         #[allow(non_snake_case)]
-        impl<$($t: EventTopic,)+> EventTopic for ($($t,)+) {
+        impl<$($ty: EventTopic,)+> EventTopic for ($($ty,)+) {
             #[inline]
             fn topic_preimage_length(rust: &Self::RustType) -> usize {
-                let ($($t,)+) = rust;
-                0usize $( + <$t>::topic_preimage_length($t) )+
+                let ($($ty,)+) = rust;
+                0usize $( + <$ty>::topic_preimage_length($ty) )+
             }
 
             #[inline]
             fn encode_topic_preimage(rust: &Self::RustType, out: &mut Vec<u8>) {
-                let b @ ($($t,)+) = rust;
+                let b @ ($($ty,)+) = rust;
                 out.reserve(Self::topic_preimage_length(b));
                 $(
-                    <$t>::encode_topic_preimage($t, out);
+                    <$ty>::encode_topic_preimage($ty, out);
                 )+
             }
 
@@ -197,8 +208,6 @@ all_the_tuples!(tuple_impls);
 fn encode_topic_bytes(sl: &[u8], out: &mut Vec<u8>) {
     let padding = 32 - sl.len() % 32;
     out.reserve(sl.len() + padding);
-
-    static PAD: [u8; 32] = [0; 32];
     out.extend_from_slice(sl);
-    out.extend_from_slice(&PAD[..padding]);
+    out.extend(core::iter::repeat(0).take(padding));
 }

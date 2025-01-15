@@ -2,7 +2,7 @@ use core::fmt;
 use ruint::BaseConvertError;
 
 /// The error type that is returned when parsing a signed integer.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseSignedError {
     /// Error that occurs when an invalid digit is encountered while parsing.
     Ruint(ruint::ParseError),
@@ -25,13 +25,20 @@ impl From<ruint::ParseError> for ParseSignedError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for ParseSignedError {}
+impl core::error::Error for ParseSignedError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            #[cfg(feature = "std")]
+            Self::Ruint(err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
 impl fmt::Display for ParseSignedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ruint(err) => write!(f, "Parsing Error: {err}"),
+            Self::Ruint(e) => e.fmt(f),
             Self::IntegerOverflow => f.write_str("number does not fit in the integer size"),
         }
     }
@@ -41,8 +48,7 @@ impl fmt::Display for ParseSignedError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BigIntConversionError;
 
-#[cfg(feature = "std")]
-impl std::error::Error for BigIntConversionError {}
+impl core::error::Error for BigIntConversionError {}
 
 impl fmt::Display for BigIntConversionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

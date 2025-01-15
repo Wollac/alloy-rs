@@ -1,4 +1,4 @@
-use super::SolIdent;
+use crate::{SolIdent, Spanned};
 use proc_macro2::{Ident, Span};
 use std::{
     fmt,
@@ -19,12 +19,6 @@ macro_rules! sol_path {
     ($($e:expr),+) => {{
         let mut path = $crate::SolPath::new();
         $(path.push($crate::SolIdent::from($e));)+
-        path
-    }};
-
-    ($($id:ident).+) => {{
-        let mut path = $crate::SolPath::new();
-        $(path.push($crate::SolIdent::new(stringify!($id))));+
         path
     }};
 }
@@ -49,12 +43,6 @@ impl DerefMut for SolPath {
     }
 }
 
-impl fmt::Debug for SolPath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(&self.0).finish()
-    }
-}
-
 impl fmt::Display for SolPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, ident) in self.0.iter().enumerate() {
@@ -64,6 +52,12 @@ impl fmt::Display for SolPath {
             ident.fmt(f)?;
         }
         Ok(())
+    }
+}
+
+impl fmt::Debug for SolPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(&self.0).finish()
     }
 }
 
@@ -79,11 +73,11 @@ impl Parse for SolPath {
         let mut segments = Punctuated::new();
         loop {
             if !input.peek(Ident::peek_any) {
-                break
+                break;
             }
             segments.push_value(input.parse()?);
             if !input.peek(Token![.]) {
-                break
+                break;
             }
             segments.push_punct(input.parse()?);
         }
@@ -95,6 +89,22 @@ impl Parse for SolPath {
         } else {
             Ok(Self(segments))
         }
+    }
+}
+
+impl Spanned for SolPath {
+    fn span(&self) -> Span {
+        self.0.span()
+    }
+
+    fn set_span(&mut self, span: Span) {
+        self.0.set_span(span);
+    }
+}
+
+impl Default for SolPath {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -115,33 +125,7 @@ impl SolPath {
         self.0.last().unwrap()
     }
 
-    // TODO: paths resolution
-    #[track_caller]
-    pub fn last_tmp(&self) -> &SolIdent {
-        if self.len() > 1 {
-            todo!("path resolution")
-        }
-        self.last()
-    }
-
     pub fn last_mut(&mut self) -> &mut SolIdent {
         self.0.last_mut().unwrap()
-    }
-
-    pub fn span(&self) -> Span {
-        let Some(first) = self.0.first() else {
-            return Span::call_site()
-        };
-        let span = first.span();
-        self.0
-            .last()
-            .and_then(|last| span.join(last.span()))
-            .unwrap_or(span)
-    }
-
-    pub fn set_span(&mut self, span: Span) {
-        for ident in self.0.iter_mut() {
-            ident.set_span(span);
-        }
     }
 }

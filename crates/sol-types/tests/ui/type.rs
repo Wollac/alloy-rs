@@ -734,4 +734,30 @@ sol! {
     }
 }
 
+sol! {
+    struct Mappings {
+        mapping(mapping(a b => c d) e => mapping(f g => h i) j) map;
+    }
+}
+
+sol! {
+    mapping(bool => mapping(address => uint256[])[])[][] public nestedMapArray;
+}
+
+sol! {
+    mapping(mapping(int => int) => int) public mapKeyOfMap;
+}
+
+sol! {
+    function mappings(mapping(uint256 a => bool b), mapping(bool => bool) x);
+}
+
+sol! {
+    struct FunctionTypes {
+        function(function(bool) external pure returns (function(function())) f) external returns (function()) c;
+    }
+
+    function functionTypes(FunctionTypes f) returns (function(function(function(), function())), function(function(), function()));
+}
+
 fn main() {}

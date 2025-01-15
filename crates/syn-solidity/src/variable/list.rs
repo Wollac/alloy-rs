@@ -1,5 +1,5 @@
-use super::VariableDeclaration;
-use crate::{SolIdent, Type};
+use crate::{SolIdent, Spanned, Type, VariableDeclaration};
+use proc_macro2::Span;
 use std::{
     fmt,
     ops::{Deref, DerefMut},
@@ -27,6 +27,22 @@ pub type FieldList = Parameters<syn::token::Semi>;
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Parameters<P>(Punctuated<VariableDeclaration, P>);
 
+impl Default for &ParameterList {
+    #[inline]
+    fn default() -> Self {
+        const NEW: &ParameterList = &ParameterList::new();
+        NEW
+    }
+}
+
+impl Default for &FieldList {
+    #[inline]
+    fn default() -> Self {
+        const NEW: &FieldList = &FieldList::new();
+        NEW
+    }
+}
+
 impl<P> Deref for Parameters<P> {
     type Target = Punctuated<VariableDeclaration, P>;
 
@@ -41,6 +57,31 @@ impl<P> DerefMut for Parameters<P> {
     }
 }
 
+impl fmt::Display for ParameterList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, param) in self.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            param.fmt(f)?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for FieldList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, field) in self.iter().enumerate() {
+            if i > 0 {
+                f.write_str(" ")?;
+            }
+            field.fmt(f)?;
+            f.write_str(";")?;
+        }
+        Ok(())
+    }
+}
+
 impl<P> fmt::Debug for Parameters<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
@@ -48,18 +89,16 @@ impl<P> fmt::Debug for Parameters<P> {
 }
 
 /// Parameter list
-impl Parse for Parameters<Token![,]> {
+impl Parse for ParameterList {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
-        input
-            .parse_terminated(VariableDeclaration::parse, Token![,])
-            .map(Self)
+        input.parse_terminated(VariableDeclaration::parse, Token![,]).map(Self)
     }
 }
 
 /// Struct: enforce semicolon after each field and field name.
-impl Parse for Parameters<Token![;]> {
+impl Parse for FieldList {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
-        let this = input.parse_terminated(VariableDeclaration::parse_for_struct, Token![;])?;
+        let this = input.parse_terminated(VariableDeclaration::parse_with_name, Token![;])?;
         if this.is_empty() {
             Err(input.error("defining empty structs is disallowed"))
         } else if !this.trailing_punct() {
@@ -67,6 +106,16 @@ impl Parse for Parameters<Token![;]> {
         } else {
             Ok(Self(this))
         }
+    }
+}
+
+impl<P: Spanned> Spanned for Parameters<P> {
+    fn span(&self) -> Span {
+        self.0.span()
+    }
+
+    fn set_span(&mut self, span: Span) {
+        self.0.set_span(span);
     }
 }
 
@@ -149,11 +198,15 @@ impl<P> Parameters<P> {
 
     #[cfg(feature = "visit")]
     pub fn visit_types(&self, mut f: impl FnMut(&Type)) {
-        self.types().for_each(|ty| ty.visit(&mut f))
+        for ty in self.types() {
+            ty.visit(&mut f);
+        }
     }
 
     #[cfg(feature = "visit-mut")]
     pub fn visit_types_mut(&mut self, mut f: impl FnMut(&mut Type)) {
-        self.types_mut().for_each(|ty| ty.visit_mut(&mut f))
+        for ty in self.types_mut() {
+            ty.visit_mut(&mut f);
+        }
     }
 }

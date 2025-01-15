@@ -1,23 +1,20 @@
 //! This module contains the [`SolStruct`] trait, which is used to implement
 //! Solidity structs logic, particularly for EIP-712 encoding/decoding.
 
-use super::{Encodable, SolType};
-use crate::{token::TokenSeq, Eip712Domain, TokenType, Word};
+use super::SolType;
+use crate::Eip712Domain;
 use alloc::{borrow::Cow, string::String, vec::Vec};
 use alloy_primitives::{keccak256, B256};
 
-type TupleFor<'a, T> = <T as SolStruct>::Tuple<'a>;
-type TupleTokenTypeFor<'a, T> = <TupleFor<'a, T> as SolType>::TokenType<'a>;
-
-/// A Solidity Struct.
+/// A Solidity struct.
 ///
 /// This trait is used to implement ABI and EIP-712 encoding and decoding.
 ///
 /// # Implementer's Guide
 ///
-/// We do not recommend implementing this trait directly. Instead, we recommend
-/// using the [`sol`][crate::sol] proc macro to parse a Solidity struct
-/// definition.
+/// It should not be necessary to implement this trait manually. Instead, use
+/// the [`sol!`](crate::sol!) procedural macro to parse Solidity syntax into
+/// types that implement this trait.
 ///
 /// # Note
 ///
@@ -31,154 +28,81 @@ type TupleTokenTypeFor<'a, T> = <TupleFor<'a, T> as SolType>::TokenType<'a>;
 ///
 /// [`eip712_encode_type`]: SolStruct::eip712_encode_type
 /// [ref]: https://eips.ethereum.org/EIPS/eip-712#definition-of-encodetype
-pub trait SolStruct: 'static {
-    /// The corresponding Tuple type, used for encoding/decoding.
-    type Tuple<'a>: SolType<TokenType<'a> = Self::Token<'a>>;
-
-    /// The corresponding Token type.
-    type Token<'a>: TokenSeq<'a>;
-
+pub trait SolStruct: SolType<RustType = Self> {
     /// The struct name.
     ///
     /// Used in [`eip712_encode_type`][SolStruct::eip712_encode_type].
     const NAME: &'static str;
 
-    /// The field types and names. Type is a Solidity string, and must conform
-    /// to the name of the Solidty type at the same index in the associated
-    /// tuple.
+    /// Returns component EIP-712 types. These types are used to construct
+    /// the `encodeType` string. These are the types of the struct's fields,
+    /// and should not include the root type.
+    fn eip712_components() -> Vec<Cow<'static, str>>;
+
+    /// Return the root EIP-712 type. This type is used to construct the
+    /// `encodeType` string.
+    fn eip712_root_type() -> Cow<'static, str>;
+
+    /// The EIP-712-encoded type string.
     ///
-    /// Used in [`eip712_encode_type`][SolStruct::eip712_encode_type].
-    const FIELDS: &'static [(&'static str, &'static str)];
-
-    // TODO: avoid clones here
-    /// Convert to the tuple type used for ABI encoding and decoding.
-    fn to_rust<'a>(&self) -> <Self::Tuple<'a> as SolType>::RustType;
-
-    /// Convert from the tuple type used for ABI encoding and decoding.
-    fn new(tuple: <Self::Tuple<'_> as SolType>::RustType) -> Self;
-
-    /// Convert to the token type used for EIP-712 encoding and decoding.
-    fn tokenize(&self) -> Self::Token<'_>;
-
-    /// The size of the struct when encoded, in bytes
-    #[inline]
-    fn encoded_size(&self) -> usize {
-        if let Some(size) = <Self::Tuple<'_> as SolType>::ENCODED_SIZE {
-            return size
-        }
-
-        self.tokenize().total_words() * Word::len_bytes()
-    }
-
-    /// EIP-712 `encodeType`
-    /// <https://eips.ethereum.org/EIPS/eip-712#definition-of-encodetype>
+    /// See [EIP-712 `encodeType`](https://eips.ethereum.org/EIPS/eip-712#definition-of-encodetype).
     fn eip712_encode_type() -> Cow<'static, str> {
-        let capacity = Self::FIELDS
-            .iter()
-            .map(|(ty, name)| ty.len() + name.len() + 1)
-            .sum::<usize>()
-            + Self::NAME.len()
-            + 2;
-        let mut out = String::with_capacity(capacity);
-        out.push_str(Self::NAME);
-        out.push('(');
-        for (i, &(ty, name)) in Self::FIELDS.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
+        fn eip712_encode_types(
+            root_type: Cow<'static, str>,
+            mut components: Vec<Cow<'static, str>>,
+        ) -> Cow<'static, str> {
+            if components.is_empty() {
+                return root_type;
             }
-            out.push_str(ty);
-            out.push(' ');
-            out.push_str(name);
+
+            components.sort_unstable();
+            components.dedup();
+
+            let mut s = String::with_capacity(
+                root_type.len() + components.iter().map(|s| s.len()).sum::<usize>(),
+            );
+            s.push_str(&root_type);
+            for component in components {
+                s.push_str(&component);
+            }
+            Cow::Owned(s)
         }
-        out.push(')');
-        out.into()
+
+        eip712_encode_types(Self::eip712_root_type(), Self::eip712_components())
     }
 
-    /// EIP-712 `typeHash`
-    /// <https://eips.ethereum.org/EIPS/eip-712#rationale-for-typehash>
+    /// Calculates the [EIP-712 `typeHash`](https://eips.ethereum.org/EIPS/eip-712#rationale-for-typehash)
+    /// for this struct.
+    ///
+    /// This is defined as the Keccak-256 hash of the
+    /// [`encodeType`](Self::eip712_encode_type) string.
     #[inline]
     fn eip712_type_hash(&self) -> B256 {
-        keccak256(<Self as SolStruct>::eip712_encode_type().as_bytes())
+        keccak256(Self::eip712_encode_type().as_bytes())
     }
 
-    /// EIP-712 `encodeData`
-    /// <https://eips.ethereum.org/EIPS/eip-712#definition-of-encodedata>
+    /// Encodes this domain using [EIP-712 `encodeData`](https://eips.ethereum.org/EIPS/eip-712#definition-of-encodedata).
     fn eip712_encode_data(&self) -> Vec<u8>;
 
-    /// EIP-712 `hashStruct`
-    /// <https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct>
+    /// Hashes this struct according to [EIP-712 `hashStruct`](https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct).
     #[inline]
     fn eip712_hash_struct(&self) -> B256 {
-        let mut type_hash = self.eip712_type_hash().to_vec();
-        type_hash.extend(self.eip712_encode_data());
-        keccak256(type_hash)
+        let mut hasher = alloy_primitives::Keccak256::new();
+        hasher.update(self.eip712_type_hash());
+        hasher.update(self.eip712_encode_data());
+        hasher.finalize()
     }
 
-    /// EIP-712 `signTypedData`
-    /// <https://eips.ethereum.org/EIPS/eip-712#specification-of-the-eth_signtypeddata-json-rpc>
+    /// Does something.
+    ///
+    /// See [EIP-712 `signTypedData`](https://eips.ethereum.org/EIPS/eip-712#specification-of-the-eth_signtypeddata-json-rpc).
     #[inline]
     fn eip712_signing_hash(&self, domain: &Eip712Domain) -> B256 {
-        let domain_separator = domain.hash_struct();
-        let struct_hash = self.eip712_hash_struct();
-
         let mut digest_input = [0u8; 2 + 32 + 32];
         digest_input[0] = 0x19;
         digest_input[1] = 0x01;
-        digest_input[2..34].copy_from_slice(&domain_separator[..]);
-        digest_input[34..66].copy_from_slice(&struct_hash[..]);
+        digest_input[2..34].copy_from_slice(&domain.hash_struct()[..]);
+        digest_input[34..66].copy_from_slice(&self.eip712_hash_struct()[..]);
         keccak256(digest_input)
-    }
-}
-
-impl<T: SolStruct> Encodable<T> for T {
-    #[inline]
-    fn to_tokens(&self) -> <Self as SolType>::TokenType<'_> {
-        <Self as SolStruct>::tokenize(self)
-    }
-}
-
-// blanket impl
-// TODO: Maybe move this to `sol!`?
-impl<T: SolStruct> SolType for T {
-    type RustType = T;
-    type TokenType<'a> = TupleTokenTypeFor<'a, T>;
-
-    const DYNAMIC: bool = TupleFor::<T>::DYNAMIC;
-
-    #[inline]
-    fn type_check(token: &Self::TokenType<'_>) -> crate::Result<()> {
-        TupleFor::<T>::type_check(token)
-    }
-
-    #[inline]
-    fn encoded_size<'a>(rust: &Self::RustType) -> usize {
-        rust.encoded_size()
-    }
-
-    #[inline]
-    fn sol_type_name() -> Cow<'static, str> {
-        Self::NAME.into()
-    }
-
-    #[inline]
-    fn detokenize(token: Self::TokenType<'_>) -> Self::RustType {
-        let tuple = TupleFor::<T>::detokenize(token);
-        T::new(tuple)
-    }
-
-    #[inline]
-    fn eip712_encode_type() -> Option<Cow<'static, str>> {
-        Some(<Self as SolStruct>::eip712_encode_type())
-    }
-
-    #[inline]
-    fn eip712_data_word<'a>(rust: &Self::RustType) -> Word {
-        keccak256(rust.eip712_hash_struct())
-    }
-
-    #[inline]
-    fn encode_packed_to<'a>(rust: &Self::RustType, out: &mut Vec<u8>) {
-        let tuple = rust.to_rust();
-        TupleFor::<T>::encode_packed_to(&tuple, out)
     }
 }

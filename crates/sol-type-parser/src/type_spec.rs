@@ -1,6 +1,16 @@
-use crate::{Error, Result, TypeStem};
+use crate::{
+    new_input,
+    utils::{spanned, str_parser},
+    Error, Input, Result, TypeStem,
+};
 use alloc::vec::Vec;
 use core::num::NonZeroUsize;
+use winnow::{
+    ascii::digit0,
+    combinator::{cut_err, delimited, repeat, trace},
+    error::{ErrMode, ErrorKind, FromExternalError},
+    PResult, Parser,
+};
 
 /// Represents a type-name. Consists of an identifier and optional array sizes.
 ///
@@ -40,14 +50,14 @@ use core::num::NonZeroUsize;
 /// ```
 /// # use alloy_sol_type_parser::TypeSpecifier;
 /// # use core::num::NonZeroUsize;
-/// let spec = TypeSpecifier::try_from("uint256[2][]")?;
+/// let spec = TypeSpecifier::parse("uint256[2][]")?;
 /// assert_eq!(spec.span(), "uint256[2][]");
 /// assert_eq!(spec.stem.span(), "uint256");
 /// // The sizes are in innermost-to-outermost order.
 /// assert_eq!(spec.sizes.as_slice(), &[NonZeroUsize::new(2), None]);
 /// # Ok::<_, alloy_sol_type_parser::Error>(())
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypeSpecifier<'a> {
     /// The full span of the specifier.
     pub span: &'a str,
@@ -77,45 +87,31 @@ impl AsRef<str> for TypeSpecifier<'_> {
 
 impl<'a> TypeSpecifier<'a> {
     /// Parse a type specifier from a string.
-    pub fn parse(span: &'a str) -> Result<Self> {
-        let span = span.trim();
+    #[inline]
+    pub fn parse(s: &'a str) -> Result<Self> {
+        Self::parser.parse(new_input(s)).map_err(Error::parser)
+    }
 
-        let mut root = span;
-        let mut sizes = vec![];
-
-        // an iterator of string slices split by `[`
-        for s in root.rsplit('[') {
-            // we've reached a root tuple so we need to include the closing
-            // paren
-            if s.contains(')') {
-                let idx = span.rfind(')').unwrap();
-                root = &span[..=idx];
-                break
-            }
-            // we've reached a root type that is not a tuple or array
-            if !s.contains(']') {
-                root = s;
-                break
-            }
-
-            let s = s
-                .trim()
-                .strip_suffix(']')
-                .ok_or_else(|| Error::invalid_type_string(span))?;
-            let size = if s.is_empty() {
-                None
-            } else {
-                Some(s.parse().map_err(|_| Error::invalid_type_string(span))?)
-            };
-            sizes.push(size);
-        }
-
-        sizes.reverse();
-        Ok(Self {
-            span,
-            stem: root.try_into()?,
-            sizes,
-        })
+    /// [`winnow`] parser for this type.
+    pub(crate) fn parser(input: &mut Input<'a>) -> PResult<Self> {
+        trace(
+            "TypeSpecifier",
+            spanned(|input: &mut Input<'a>| {
+                let stem = TypeStem::parser(input)?;
+                let sizes = if input.starts_with('[') {
+                    repeat(
+                        1..,
+                        delimited(str_parser("["), array_size_parser, cut_err(str_parser("]"))),
+                    )
+                    .parse_next(input)?
+                } else {
+                    Vec::new()
+                };
+                Ok((stem, sizes))
+            }),
+        )
+        .parse_next(input)
+        .map(|(span, (stem, sizes))| Self { span, stem, sizes })
     }
 
     /// Returns the type stem as a string.
@@ -135,81 +131,183 @@ impl<'a> TypeSpecifier<'a> {
     pub fn try_basic_solidity(&self) -> Result<()> {
         self.stem.try_basic_solidity()
     }
+
+    /// Returns true if this type is an array.
+    #[inline]
+    pub fn is_array(&self) -> bool {
+        !self.sizes.is_empty()
+    }
+}
+
+fn array_size_parser(input: &mut Input<'_>) -> PResult<Option<NonZeroUsize>> {
+    let digits = digit0(input)?;
+    if digits.is_empty() {
+        return Ok(None);
+    }
+    digits.parse().map(Some).map_err(|e| ErrMode::from_external_error(input, ErrorKind::Verify, e))
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
     use crate::TupleSpecifier;
+    use alloc::string::ToString;
+
+    #[track_caller]
+    fn assert_error_contains(e: &Error, s: &str) {
+        if cfg!(feature = "std") {
+            let es = e.to_string();
+            assert!(es.contains(s), "{s:?} not in {es:?}");
+        }
+    }
 
     #[test]
     fn parse_test() {
         assert_eq!(
-            super::TypeSpecifier::try_from("uint256").unwrap(),
-            super::TypeSpecifier {
+            TypeSpecifier::parse("uint"),
+            Ok(TypeSpecifier {
+                span: "uint",
+                stem: TypeStem::parse("uint256").unwrap(),
+                sizes: vec![],
+            })
+        );
+
+        assert_eq!(
+            TypeSpecifier::parse("uint256"),
+            Ok(TypeSpecifier {
                 span: "uint256",
-                stem: TypeStem::try_from("uint256").unwrap(),
+                stem: TypeStem::parse("uint256").unwrap(),
                 sizes: vec![],
-            }
+            })
         );
 
         assert_eq!(
-            super::TypeSpecifier::try_from("uint256[2]").unwrap(),
-            super::TypeSpecifier {
+            TypeSpecifier::parse("uint256[2]"),
+            Ok(TypeSpecifier {
                 span: "uint256[2]",
-                stem: TypeStem::try_from("uint256").unwrap(),
+                stem: TypeStem::parse("uint256").unwrap(),
                 sizes: vec![NonZeroUsize::new(2)],
-            }
+            })
         );
 
         assert_eq!(
-            super::TypeSpecifier::try_from("uint256[2][]").unwrap(),
-            super::TypeSpecifier {
+            TypeSpecifier::parse("uint256[2][]"),
+            Ok(TypeSpecifier {
                 span: "uint256[2][]",
-                stem: TypeStem::try_from("uint256").unwrap(),
+                stem: TypeStem::parse("uint256").unwrap(),
                 sizes: vec![NonZeroUsize::new(2), None],
-            }
+            })
         );
 
         assert_eq!(
-            super::TypeSpecifier::try_from("(uint256,uint256)").unwrap(),
-            super::TypeSpecifier {
+            TypeSpecifier::parse("(uint256,uint256)"),
+            Ok(TypeSpecifier {
                 span: "(uint256,uint256)",
-                stem: TypeStem::Tuple(TupleSpecifier::try_from("(uint256,uint256)").unwrap()),
+                stem: TypeStem::Tuple(TupleSpecifier::parse("(uint256,uint256)").unwrap()),
                 sizes: vec![],
-            }
+            })
         );
 
         assert_eq!(
-            super::TypeSpecifier::try_from("(uint256,uint256)[2]").unwrap(),
-            super::TypeSpecifier {
+            TypeSpecifier::parse("(uint256,uint256)[2]"),
+            Ok(TypeSpecifier {
                 span: "(uint256,uint256)[2]",
-                stem: TypeStem::Tuple(TupleSpecifier::try_from("(uint256,uint256)").unwrap()),
+                stem: TypeStem::Tuple(TupleSpecifier::parse("(uint256,uint256)").unwrap()),
                 sizes: vec![NonZeroUsize::new(2)],
-            }
+            })
         );
 
         assert_eq!(
-            super::TypeSpecifier::try_from("MyStruct").unwrap(),
-            super::TypeSpecifier {
+            TypeSpecifier::parse("MyStruct"),
+            Ok(TypeSpecifier {
                 span: "MyStruct",
-                stem: TypeStem::try_from("MyStruct").unwrap(),
+                stem: TypeStem::parse("MyStruct").unwrap(),
                 sizes: vec![],
-            }
+            })
         );
 
         assert_eq!(
-            super::TypeSpecifier::try_from("MyStruct[2]").unwrap(),
-            super::TypeSpecifier {
+            TypeSpecifier::parse("MyStruct[2]"),
+            Ok(TypeSpecifier {
                 span: "MyStruct[2]",
-                stem: TypeStem::try_from("MyStruct").unwrap(),
+                stem: TypeStem::parse("MyStruct").unwrap(),
                 sizes: vec![NonZeroUsize::new(2)],
-            }
+            })
         );
     }
 
     #[test]
-    fn a_type_named_tuple() {
-        TypeSpecifier::try_from("tuple").unwrap();
+    fn sizes() {
+        TypeSpecifier::parse("a[").unwrap_err();
+        TypeSpecifier::parse("a[][").unwrap_err();
+
+        assert_eq!(
+            TypeSpecifier::parse("a[]"),
+            Ok(TypeSpecifier {
+                span: "a[]",
+                stem: TypeStem::parse("a").unwrap(),
+                sizes: vec![None],
+            }),
+        );
+
+        assert_eq!(
+            TypeSpecifier::parse("a[1]"),
+            Ok(TypeSpecifier {
+                span: "a[1]",
+                stem: TypeStem::parse("a").unwrap(),
+                sizes: vec![NonZeroUsize::new(1)],
+            }),
+        );
+
+        let e = TypeSpecifier::parse("a[0]").unwrap_err();
+        assert_error_contains(&e, "number would be zero for non-zero type");
+        TypeSpecifier::parse("a[x]").unwrap_err();
+
+        TypeSpecifier::parse("a[ ]").unwrap_err();
+        TypeSpecifier::parse("a[  ]").unwrap_err();
+        TypeSpecifier::parse("a[ 0]").unwrap_err();
+        TypeSpecifier::parse("a[0 ]").unwrap_err();
+
+        TypeSpecifier::parse("a[a]").unwrap_err();
+        TypeSpecifier::parse("a[ a]").unwrap_err();
+        TypeSpecifier::parse("a[a ]").unwrap_err();
+
+        TypeSpecifier::parse("a[ 1]").unwrap_err();
+        TypeSpecifier::parse("a[1 ]").unwrap_err();
+
+        TypeSpecifier::parse(&format!("a[{}]", usize::MAX)).unwrap();
+        let e = TypeSpecifier::parse(&format!("a[{}0]", usize::MAX)).unwrap_err();
+        assert_error_contains(&e, "number too large to fit in target type");
+    }
+
+    #[test]
+    fn try_basic_solidity() {
+        assert_eq!(TypeSpecifier::parse("uint").unwrap().try_basic_solidity(), Ok(()));
+        assert_eq!(TypeSpecifier::parse("int").unwrap().try_basic_solidity(), Ok(()));
+        assert_eq!(TypeSpecifier::parse("uint256").unwrap().try_basic_solidity(), Ok(()));
+        assert_eq!(TypeSpecifier::parse("uint256[]").unwrap().try_basic_solidity(), Ok(()));
+        assert_eq!(TypeSpecifier::parse("(uint256,uint256)").unwrap().try_basic_solidity(), Ok(()));
+        assert_eq!(
+            TypeSpecifier::parse("(uint256,uint256)[2]").unwrap().try_basic_solidity(),
+            Ok(())
+        );
+        assert_eq!(
+            TypeSpecifier::parse("tuple(uint256,uint256)").unwrap().try_basic_solidity(),
+            Ok(())
+        );
+        assert_eq!(
+            TypeSpecifier::parse("tuple(address,bytes,(bool,(string,uint256)[][3]))[2]")
+                .unwrap()
+                .try_basic_solidity(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn not_basic_solidity() {
+        assert_eq!(
+            TypeSpecifier::parse("MyStruct").unwrap().try_basic_solidity(),
+            Err(Error::invalid_type_string("MyStruct"))
+        );
     }
 }

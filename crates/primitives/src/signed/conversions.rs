@@ -6,9 +6,9 @@ use ruint::Uint;
 impl<const BITS: usize, const LIMBS: usize> TryFrom<Uint<BITS, LIMBS>> for Signed<BITS, LIMBS> {
     type Error = BigIntConversionError;
 
-    #[inline(always)]
+    #[inline]
     fn try_from(from: Uint<BITS, LIMBS>) -> Result<Self, Self::Error> {
-        let value = Signed(from);
+        let value = Self(from);
         match value.sign() {
             Sign::Positive => Ok(value),
             Sign::Negative => Err(BigIntConversionError),
@@ -19,7 +19,7 @@ impl<const BITS: usize, const LIMBS: usize> TryFrom<Uint<BITS, LIMBS>> for Signe
 impl<const BITS: usize, const LIMBS: usize> TryFrom<Signed<BITS, LIMBS>> for Uint<BITS, LIMBS> {
     type Error = BigIntConversionError;
 
-    #[inline(always)]
+    #[inline]
     fn try_from(value: Signed<BITS, LIMBS>) -> Result<Self, Self::Error> {
         match value.sign() {
             Sign::Positive => Ok(value.0),
@@ -29,27 +29,27 @@ impl<const BITS: usize, const LIMBS: usize> TryFrom<Signed<BITS, LIMBS>> for Uin
 }
 
 impl<const BITS: usize, const LIMBS: usize> TryFrom<&str> for Signed<BITS, LIMBS> {
-    type Error = <Self as FromStr>::Err;
+    type Error = ParseSignedError;
 
-    #[inline(always)]
+    #[inline]
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         Self::from_str(value)
     }
 }
 
 impl<const BITS: usize, const LIMBS: usize> TryFrom<&String> for Signed<BITS, LIMBS> {
-    type Error = <Self as FromStr>::Err;
+    type Error = ParseSignedError;
 
-    #[inline(always)]
+    #[inline]
     fn try_from(value: &String) -> Result<Self, Self::Error> {
         value.parse()
     }
 }
 
 impl<const BITS: usize, const LIMBS: usize> TryFrom<String> for Signed<BITS, LIMBS> {
-    type Error = <Self as FromStr>::Err;
+    type Error = ParseSignedError;
 
-    #[inline(always)]
+    #[inline]
     fn try_from(value: String) -> Result<Self, Self::Error> {
         value.parse()
     }
@@ -58,9 +58,15 @@ impl<const BITS: usize, const LIMBS: usize> TryFrom<String> for Signed<BITS, LIM
 impl<const BITS: usize, const LIMBS: usize> FromStr for Signed<BITS, LIMBS> {
     type Err = ParseSignedError;
 
-    #[inline(always)]
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Signed::from_dec_str(value).or_else(|_| Signed::from_hex_str(value))
+    #[inline]
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (sign, s) = match s.as_bytes().first() {
+            Some(b'+') => (Sign::Positive, &s[1..]),
+            Some(b'-') => (Sign::Negative, &s[1..]),
+            _ => (Sign::Positive, s),
+        };
+        let abs = Uint::<BITS, LIMBS>::from_str(s)?;
+        Self::checked_from_sign_and_abs(sign, abs).ok_or(ParseSignedError::IntegerOverflow)
     }
 }
 
@@ -69,14 +75,14 @@ impl<const BITS: usize, const LIMBS: usize> TryFrom<Signed<BITS, LIMBS>> for i12
 
     fn try_from(value: Signed<BITS, LIMBS>) -> Result<Self, Self::Error> {
         if value.bits() > 128 {
-            return Err(BigIntConversionError)
+            return Err(BigIntConversionError);
         }
 
         if value.is_positive() {
-            Ok(u128::try_from(value.0).unwrap() as i128)
+            Ok(u128::try_from(value.0).unwrap() as Self)
         } else {
             let u = twos_complement(value.0);
-            let u = u128::try_from(u).unwrap() as i128;
+            let u = u128::try_from(u).unwrap() as Self;
             Ok((!u).wrapping_add(1))
         }
     }
@@ -88,7 +94,7 @@ impl<const BITS: usize, const LIMBS: usize> TryFrom<i128> for Signed<BITS, LIMBS
     fn try_from(value: i128) -> Result<Self, Self::Error> {
         let u = value as u128;
         if value >= 0 {
-            return Self::try_from(u)
+            return Self::try_from(u);
         }
 
         // This is a bit messy :(
@@ -96,9 +102,9 @@ impl<const BITS: usize, const LIMBS: usize> TryFrom<i128> for Signed<BITS, LIMBS
         let stc = Uint::<128, 2>::saturating_from(tc);
         let (num, overflow) = Uint::<BITS, LIMBS>::overflowing_from_limbs_slice(stc.as_limbs());
         if overflow {
-            return Err(BigIntConversionError)
+            return Err(BigIntConversionError);
         }
-        Ok(Signed(twos_complement(num)))
+        Ok(Self(twos_complement(num)))
     }
 }
 
@@ -107,20 +113,17 @@ impl<const BITS: usize, const LIMBS: usize> TryFrom<Signed<BITS, LIMBS>> for u12
 
     fn try_from(value: Signed<BITS, LIMBS>) -> Result<Self, Self::Error> {
         if value.is_negative() {
-            return Err(BigIntConversionError)
+            return Err(BigIntConversionError);
         }
 
-        let saturated = Uint::<BITS, LIMBS>::saturating_from(u128::MAX);
+        let saturated = Uint::<BITS, LIMBS>::saturating_from(Self::MAX);
 
         // if the value is greater than the saturated value, return an error
         if value > Signed(saturated) {
-            return Err(BigIntConversionError)
+            return Err(BigIntConversionError);
         }
 
-        value
-            .into_raw()
-            .try_into()
-            .map_err(|_| BigIntConversionError)
+        value.into_raw().try_into().map_err(|_| BigIntConversionError)
     }
 }
 
@@ -131,10 +134,10 @@ impl<const BITS: usize, const LIMBS: usize> TryFrom<u128> for Signed<BITS, LIMBS
         let saturated = Uint::<BITS, LIMBS>::saturating_from(value);
 
         if value != saturated.to::<u128>() {
-            return Err(BigIntConversionError)
+            return Err(BigIntConversionError);
         }
 
-        Signed::try_from(saturated)
+        Self::try_from(saturated)
     }
 }
 
@@ -157,7 +160,7 @@ macro_rules! impl_conversions {
             impl<const BITS: usize, const LIMBS: usize> TryFrom<$u> for Signed<BITS, LIMBS> {
                 type Error = BigIntConversionError;
 
-                #[inline(always)]
+                #[inline]
                 fn try_from(value: $u) -> Result<Self, Self::Error> {
                     let u = Uint::<BITS, LIMBS>::try_from(value).map_err(|_| BigIntConversionError)?;
                     Signed::checked_from_sign_and_abs(Sign::Positive, u).ok_or(BigIntConversionError)
@@ -167,7 +170,7 @@ macro_rules! impl_conversions {
             impl<const BITS: usize, const LIMBS: usize> TryFrom<$i> for Signed<BITS, LIMBS> {
                 type Error = BigIntConversionError;
 
-                #[inline(always)]
+                #[inline]
                 fn try_from(value: $i) -> Result<Self, Self::Error> {
                     let uint: $u = value as $u;
 
@@ -184,7 +187,7 @@ macro_rules! impl_conversions {
             impl<const BITS: usize, const LIMBS: usize> TryFrom<Signed<BITS, LIMBS>> for $u {
                 type Error = BigIntConversionError;
 
-                #[inline(always)]
+                #[inline]
                 fn try_from(value: Signed<BITS, LIMBS>) -> Result<$u, Self::Error> {
                     u128::try_from(value)?.try_into().map_err(|_| BigIntConversionError)
                 }
@@ -193,7 +196,7 @@ macro_rules! impl_conversions {
             impl<const BITS: usize, const LIMBS: usize> TryFrom<Signed<BITS, LIMBS>> for $i {
                 type Error = BigIntConversionError;
 
-                #[inline(always)]
+                #[inline]
                 fn try_from(value: Signed<BITS, LIMBS>) -> Result<$i, Self::Error> {
                     i128::try_from(value)?.try_into().map_err(|_| BigIntConversionError)
                 }
@@ -203,7 +206,7 @@ macro_rules! impl_conversions {
 
     (@impl_fns $t:ty, $actual_low:ident $low:ident $as:ident) => {
         /// Low word.
-        #[inline(always)]
+        #[inline]
         pub const fn $low(&self) -> $t {
             if BITS == 0 {
                 return 0
@@ -216,8 +219,8 @@ macro_rules! impl_conversions {
         ///
         /// # Panics
         ///
-        #[doc = concat!("If the number is outside the ", stringify!($t), " valid range.")]
-        #[inline(always)]
+        #[doc = concat!("Panics if the number is outside the ", stringify!($t), " valid range.")]
+        #[inline]
         #[track_caller]
         pub fn $as(&self) -> $t {
             <$t as TryFrom<Self>>::try_from(*self).unwrap()

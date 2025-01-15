@@ -1,4 +1,4 @@
-use crate::{kw, SolIdent, Type};
+use crate::{kw, SolIdent, Spanned, Type, VariableDeclaration};
 use proc_macro2::Span;
 use std::{
     fmt,
@@ -38,6 +38,20 @@ impl Hash for TypeMapping {
     }
 }
 
+impl fmt::Display for TypeMapping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "mapping({} ", self.key)?;
+        if let Some(key_name) = &self.key_name {
+            write!(f, "{key_name} ")?;
+        }
+        write!(f, "=> {} ", self.value)?;
+        if let Some(value_name) = &self.value_name {
+            write!(f, "{value_name}")?;
+        }
+        f.write_str(")")
+    }
+}
+
 impl fmt::Debug for TypeMapping {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TypeMapping")
@@ -46,12 +60,6 @@ impl fmt::Debug for TypeMapping {
             .field("value", &self.value)
             .field("value_name", &self.value_name)
             .finish()
-    }
-}
-
-impl fmt::Display for TypeMapping {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "mapping({} => {})", self.key, self.value)
     }
 }
 
@@ -70,13 +78,13 @@ impl Parse for TypeMapping {
     }
 }
 
-impl TypeMapping {
-    pub fn span(&self) -> Span {
+impl Spanned for TypeMapping {
+    fn span(&self) -> Span {
         let span = self.mapping_token.span;
         span.join(self.paren_token.span.join()).unwrap_or(span)
     }
 
-    pub fn set_span(&mut self, span: Span) {
+    fn set_span(&mut self, span: Span) {
         self.mapping_token.span = span;
         self.paren_token = Paren(span);
         self.key.set_span(span);
@@ -87,5 +95,17 @@ impl TypeMapping {
         if let Some(value_name) = &mut self.value_name {
             value_name.set_span(span);
         }
+    }
+}
+
+impl TypeMapping {
+    /// Returns a `VariableDeclaration` corresponding to this mapping's key.
+    pub fn key_var(&self) -> VariableDeclaration {
+        VariableDeclaration::new_with((*self.key).clone(), None, self.key_name.clone())
+    }
+
+    /// Returns a `VariableDeclaration` corresponding to this mapping's value.
+    pub fn value_var(&self) -> VariableDeclaration {
+        VariableDeclaration::new_with((*self.value).clone(), None, self.value_name.clone())
     }
 }

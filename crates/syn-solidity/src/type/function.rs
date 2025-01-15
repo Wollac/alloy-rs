@@ -1,4 +1,4 @@
-use crate::{kw, FunctionAttributes, Parameters, Returns};
+use crate::{kw, FunctionAttributes, ParameterList, Returns, Spanned};
 use proc_macro2::Span;
 use std::{
     fmt,
@@ -8,10 +8,10 @@ use syn::{
     parenthesized,
     parse::{Parse, ParseStream},
     token::Paren,
-    Result, Token,
+    Result,
 };
 
-/// A function type: `function() returns (string memory)`
+/// A function type: `function() returns (string memory)`.
 ///
 /// Solidity reference:
 /// <https://docs.soliditylang.org/en/latest/grammar.html#a4.SolidityParser.functionTypeName>
@@ -19,7 +19,7 @@ use syn::{
 pub struct TypeFunction {
     pub function_token: kw::function,
     pub paren_token: Paren,
-    pub arguments: Parameters<Token![,]>,
+    pub arguments: ParameterList,
     /// The Solidity attributes of the function.
     pub attributes: FunctionAttributes,
     /// The optional return types of the function.
@@ -44,19 +44,17 @@ impl Hash for TypeFunction {
 impl fmt::Display for TypeFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("function (")?;
-        for (i, arg) in self.arguments.iter().enumerate() {
-            if i > 0 {
-                f.write_str(", ")?;
-            }
-            write!(f, "{arg}")?;
-        }
+        self.arguments.fmt(f)?;
         f.write_str(")")?;
+
         for attr in &self.attributes.0 {
-            write!(f, " {}", attr)?;
+            write!(f, " {attr}")?;
         }
+
         if let Some(returns) = &self.returns {
-            write!(f, " {}", returns)?;
+            write!(f, " {returns}")?;
         }
+
         Ok(())
     }
 }
@@ -84,12 +82,12 @@ impl Parse for TypeFunction {
     }
 }
 
-impl TypeFunction {
-    pub fn span(&self) -> Span {
+impl Spanned for TypeFunction {
+    fn span(&self) -> Span {
         self.function_token.span
     }
 
-    pub fn set_span(&mut self, span: Span) {
+    fn set_span(&mut self, span: Span) {
         self.function_token.span = span;
     }
 }

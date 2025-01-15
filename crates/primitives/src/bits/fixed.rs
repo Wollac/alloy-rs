@@ -1,6 +1,7 @@
 use crate::aliases;
-use core::{fmt, ops, str};
+use core::{fmt, iter, ops, str};
 use derive_more::{Deref, DerefMut, From, Index, IndexMut, IntoIterator};
+use hex::FromHex;
 
 /// A byte array of fixed length (`[u8; N]`).
 ///
@@ -26,19 +27,24 @@ use derive_more::{Deref, DerefMut, From, Index, IndexMut, IntoIterator};
     IndexMut,
     IntoIterator,
 )]
-#[cfg_attr(
-    feature = "arbitrary",
-    derive(derive_arbitrary::Arbitrary, proptest_derive::Arbitrary)
-)]
+#[cfg_attr(feature = "arbitrary", derive(derive_arbitrary::Arbitrary, proptest_derive::Arbitrary))]
+#[cfg_attr(feature = "allocative", derive(allocative::Allocative))]
 #[repr(transparent)]
 pub struct FixedBytes<const N: usize>(#[into_iterator(owned, ref, ref_mut)] pub [u8; N]);
 
-crate::impl_fixed_bytes_traits!(FixedBytes<N>, N, const);
+crate::impl_fb_traits!(FixedBytes<N>, N, const);
 
 impl<const N: usize> Default for FixedBytes<N> {
     #[inline]
     fn default() -> Self {
         Self::ZERO
+    }
+}
+
+impl<const N: usize> Default for &FixedBytes<N> {
+    #[inline]
+    fn default() -> Self {
+        &FixedBytes::ZERO
     }
 }
 
@@ -63,7 +69,7 @@ impl<const N: usize> TryFrom<&[u8]> for FixedBytes<N> {
 
     #[inline]
     fn try_from(slice: &[u8]) -> Result<Self, Self::Error> {
-        <&Self>::try_from(slice).map(|this| *this)
+        <&Self>::try_from(slice).copied()
     }
 }
 
@@ -106,39 +112,53 @@ impl<'a, const N: usize> TryFrom<&'a mut [u8]> for &'a mut FixedBytes<N> {
 // `impl<const N: usize> From<FixedBytes<N>> for Uint<N * 8>`
 // `impl<const N: usize> From<Uint<N / 8>> for FixedBytes<N>`
 macro_rules! fixed_bytes_uint_conversions {
-    ($($u:ty => $b:ty),* $(,)?) => {$(
-        impl From<$u> for $b {
+    ($($int:ty => $fb:ty),* $(,)?) => {$(
+        impl From<$int> for $fb {
+            /// Converts a fixed-width unsigned integer into a fixed byte array
+            /// by interpreting the bytes as big-endian.
             #[inline]
-            fn from(value: $u) -> Self {
+            fn from(value: $int) -> Self {
                 Self(value.to_be_bytes())
             }
         }
 
-        impl From<$b> for $u {
+        impl From<$fb> for $int {
+            /// Converts a fixed byte array into a fixed-width unsigned integer
+            /// by interpreting the bytes as big-endian.
             #[inline]
-            fn from(value: $b) -> Self {
+            fn from(value: $fb) -> Self {
                 Self::from_be_bytes(value.0)
             }
         }
 
-        const _: () = assert!(<$u>::BITS == <$b>::len_bytes() * 8);
+        const _: () = assert!(<$int>::BITS as usize == <$fb>::len_bytes() * 8);
     )*};
 }
 
 fixed_bytes_uint_conversions! {
+    u8            => aliases::B8,
     aliases::U8   => aliases::B8,
+    i8            => aliases::B8,
     aliases::I8   => aliases::B8,
 
+    u16           => aliases::B16,
     aliases::U16  => aliases::B16,
+    i16           => aliases::B16,
     aliases::I16  => aliases::B16,
 
+    u32           => aliases::B32,
     aliases::U32  => aliases::B32,
+    i32           => aliases::B32,
     aliases::I32  => aliases::B32,
 
+    u64           => aliases::B64,
     aliases::U64  => aliases::B64,
+    i64           => aliases::B64,
     aliases::I64  => aliases::B64,
 
+    u128          => aliases::B128,
     aliases::U128 => aliases::B128,
+    i128          => aliases::B128,
     aliases::I128 => aliases::B128,
 
     aliases::U160 => aliases::B160,
@@ -198,7 +218,7 @@ impl<const N: usize> fmt::Display for FixedBytes<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // If the alternate flag is NOT set, we write the full hex.
         if N <= 4 || !f.alternate() {
-            return self.fmt_hex::<false>(f, true)
+            return self.fmt_hex::<false>(f, true);
         }
 
         // If the alternate flag is set, we use middle-out compression.
@@ -232,58 +252,83 @@ impl<const N: usize> fmt::UpperHex for FixedBytes<N> {
 impl<const N: usize> ops::BitAnd for FixedBytes<N> {
     type Output = Self;
 
-    fn bitand(self, rhs: Self) -> Self::Output {
-        let mut other = self;
-        other.iter_mut().zip(rhs.iter()).for_each(|(a, b)| *a &= *b);
-        other
+    #[inline]
+    fn bitand(mut self, rhs: Self) -> Self::Output {
+        self &= rhs;
+        self
     }
 }
 
 impl<const N: usize> ops::BitAndAssign for FixedBytes<N> {
+    #[inline]
     fn bitand_assign(&mut self, rhs: Self) {
-        self.iter_mut().zip(rhs.iter()).for_each(|(a, b)| *a &= *b);
+        // Note: `slice::Iter` has better codegen than `array::IntoIter`
+        iter::zip(self, &rhs).for_each(|(a, b)| *a &= *b);
     }
 }
 
 impl<const N: usize> ops::BitOr for FixedBytes<N> {
     type Output = Self;
 
-    fn bitor(self, rhs: Self) -> Self::Output {
-        let mut other = self;
-        other.iter_mut().zip(rhs.iter()).for_each(|(a, b)| *a |= *b);
-        other
+    #[inline]
+    fn bitor(mut self, rhs: Self) -> Self::Output {
+        self |= rhs;
+        self
     }
 }
 
 impl<const N: usize> ops::BitOrAssign for FixedBytes<N> {
+    #[inline]
     fn bitor_assign(&mut self, rhs: Self) {
-        self.iter_mut().zip(rhs.iter()).for_each(|(a, b)| *a |= *b);
+        // Note: `slice::Iter` has better codegen than `array::IntoIter`
+        iter::zip(self, &rhs).for_each(|(a, b)| *a |= *b);
     }
 }
 
 impl<const N: usize> ops::BitXor for FixedBytes<N> {
     type Output = Self;
 
-    fn bitxor(self, rhs: Self) -> Self::Output {
-        let mut other = self;
-        other.iter_mut().zip(rhs.iter()).for_each(|(a, b)| *a ^= *b);
-        other
+    #[inline]
+    fn bitxor(mut self, rhs: Self) -> Self::Output {
+        self ^= rhs;
+        self
     }
 }
 
 impl<const N: usize> ops::BitXorAssign for FixedBytes<N> {
+    #[inline]
     fn bitxor_assign(&mut self, rhs: Self) {
-        self.iter_mut().zip(rhs.iter()).for_each(|(a, b)| *a ^= *b);
+        // Note: `slice::Iter` has better codegen than `array::IntoIter`
+        iter::zip(self, &rhs).for_each(|(a, b)| *a ^= *b);
     }
 }
 
-impl<const N: usize> core::str::FromStr for FixedBytes<N> {
+impl<const N: usize> ops::Not for FixedBytes<N> {
+    type Output = Self;
+
+    #[inline]
+    fn not(mut self) -> Self::Output {
+        self.iter_mut().for_each(|byte| *byte = !*byte);
+        self
+    }
+}
+
+impl<const N: usize> str::FromStr for FixedBytes<N> {
     type Err = hex::FromHexError;
 
+    #[inline]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut buf = [0u8; N];
-        hex::decode_to_slice(s, &mut buf)?;
-        Ok(Self(buf))
+        Self::from_hex(s)
+    }
+}
+
+#[cfg(feature = "rand")]
+impl<const N: usize> rand::distributions::Distribution<FixedBytes<N>>
+    for rand::distributions::Standard
+{
+    #[inline]
+    fn sample<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> FixedBytes<N> {
+        FixedBytes::random_with(rng)
     }
 }
 
@@ -291,34 +336,102 @@ impl<const N: usize> FixedBytes<N> {
     /// Array of Zero bytes.
     pub const ZERO: Self = Self([0u8; N]);
 
-    /// Instantiates a new fixed hash from the given bytes array.
+    /// Wraps the given byte array in [`FixedBytes`].
     #[inline]
     pub const fn new(bytes: [u8; N]) -> Self {
         Self(bytes)
     }
 
-    /// Utility function to create a fixed hash with the last byte set to `x`.
+    /// Creates a new [`FixedBytes`] with the last byte set to `x`.
     #[inline]
     pub const fn with_last_byte(x: u8) -> Self {
         let mut bytes = [0u8; N];
-        bytes[N - 1] = x;
+        if N > 0 {
+            bytes[N - 1] = x;
+        }
         Self(bytes)
     }
 
-    /// Instantiates a new fixed hash with cryptographically random content.
+    /// Creates a new [`FixedBytes`] where all bytes are set to `byte`.
+    #[inline]
+    pub const fn repeat_byte(byte: u8) -> Self {
+        Self([byte; N])
+    }
+
+    /// Returns the size of this byte array (`N`).
+    #[inline(always)]
+    pub const fn len_bytes() -> usize {
+        N
+    }
+
+    /// Creates a new [`FixedBytes`] with cryptographically random content.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying call to
+    /// [`getrandom_uninit`](getrandom::getrandom_uninit) fails.
     #[cfg(feature = "getrandom")]
     #[inline]
+    #[track_caller]
     pub fn random() -> Self {
         Self::try_random().unwrap()
     }
 
-    /// Instantiates a new fixed hash with cryptographically random content.
+    /// Tries to create a new [`FixedBytes`] with cryptographically random
+    /// content.
+    ///
+    /// # Errors
+    ///
+    /// This function only propagates the error from the underlying call to
+    /// [`getrandom_uninit`](getrandom::getrandom_uninit).
     #[cfg(feature = "getrandom")]
+    #[inline]
     pub fn try_random() -> Result<Self, getrandom::Error> {
-        let mut bytes: [_; N] = crate::impl_core::uninit_array();
-        getrandom::getrandom_uninit(&mut bytes)?;
-        // SAFETY: The array is initialized by getrandom_uninit.
-        Ok(Self(unsafe { crate::impl_core::array_assume_init(bytes) }))
+        let mut bytes = Self::ZERO;
+        bytes.try_randomize()?;
+        Ok(bytes)
+    }
+
+    /// Creates a new [`FixedBytes`] with the given random number generator.
+    #[cfg(feature = "rand")]
+    #[inline]
+    #[doc(alias = "random_using")]
+    pub fn random_with<R: rand::Rng + ?Sized>(rng: &mut R) -> Self {
+        let mut bytes = Self::ZERO;
+        bytes.randomize_with(rng);
+        bytes
+    }
+
+    /// Fills this [`FixedBytes`] with cryptographically random content.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying call to
+    /// [`getrandom_uninit`](getrandom::getrandom_uninit) fails.
+    #[cfg(feature = "getrandom")]
+    #[inline]
+    #[track_caller]
+    pub fn randomize(&mut self) {
+        self.try_randomize().unwrap()
+    }
+
+    /// Tries to fill this [`FixedBytes`] with cryptographically random content.
+    ///
+    /// # Errors
+    ///
+    /// This function only propagates the error from the underlying call to
+    /// [`getrandom_uninit`](getrandom::getrandom_uninit).
+    #[inline]
+    #[cfg(feature = "getrandom")]
+    pub fn try_randomize(&mut self) -> Result<(), getrandom::Error> {
+        getrandom::getrandom(&mut self.0)
+    }
+
+    /// Fills this [`FixedBytes`] with the given random number generator.
+    #[cfg(feature = "rand")]
+    #[doc(alias = "randomize_using")]
+    pub fn randomize_with<R: rand::Rng + ?Sized>(&mut self, rng: &mut R) {
+        rng.fill_bytes(&mut self.0);
     }
 
     /// Concatenate two `FixedBytes`.
@@ -328,15 +441,12 @@ impl<const N: usize> FixedBytes<N> {
     ///
     /// # Panics
     ///
-    /// This function panics if `Z` is not equal to `N + M`.
+    /// Panics if `Z` is not equal to `N + M`.
     pub const fn concat_const<const M: usize, const Z: usize>(
         self,
         other: FixedBytes<M>,
     ) -> FixedBytes<Z> {
-        assert!(
-            N + M == Z,
-            "Output size `Z` must equal the sum of the input sizes `N` and `M`"
-        );
+        assert!(N + M == Z, "Output size `Z` must equal the sum of the input sizes `N` and `M`");
 
         let mut result = [0u8; Z];
         let mut i = 0;
@@ -347,19 +457,9 @@ impl<const N: usize> FixedBytes<N> {
         FixedBytes(result)
     }
 
-    /// Returns a new fixed hash where all bits are set to the given byte.
-    #[inline]
-    pub const fn repeat_byte(byte: u8) -> Self {
-        Self([byte; N])
-    }
-
-    /// Returns the size of this hash in bytes.
-    #[inline]
-    pub const fn len_bytes() -> usize {
-        N
-    }
-
-    /// Create a new fixed-hash from the given slice `src`.
+    /// Create a new [`FixedBytes`] from the given slice `src`.
+    ///
+    /// For a fallible version, use the `TryFrom<&[u8]>` implementation.
     ///
     /// # Note
     ///
@@ -368,10 +468,53 @@ impl<const N: usize> FixedBytes<N> {
     /// # Panics
     ///
     /// If the length of `src` and the number of bytes in `Self` do not match.
-    #[track_caller]
     #[inline]
+    #[track_caller]
     pub fn from_slice(src: &[u8]) -> Self {
-        Self(src.try_into().unwrap())
+        match Self::try_from(src) {
+            Ok(x) => x,
+            Err(_) => panic!("cannot convert a slice of length {} to FixedBytes<{N}>", src.len()),
+        }
+    }
+
+    /// Create a new [`FixedBytes`] from the given slice `src`, left-padding it
+    /// with zeroes if necessary.
+    ///
+    /// # Note
+    ///
+    /// The given bytes are interpreted in big endian order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `src.len() > N`.
+    #[inline]
+    #[track_caller]
+    pub fn left_padding_from(value: &[u8]) -> Self {
+        let len = value.len();
+        assert!(len <= N, "slice is too large. Expected <={N} bytes, got {len}");
+        let mut bytes = Self::ZERO;
+        bytes[N - len..].copy_from_slice(value);
+        bytes
+    }
+
+    /// Create a new [`FixedBytes`] from the given slice `src`, right-padding it
+    /// with zeroes if necessary.
+    ///
+    /// # Note
+    ///
+    /// The given bytes are interpreted in big endian order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `src.len() > N`.
+    #[inline]
+    #[track_caller]
+    pub fn right_padding_from(value: &[u8]) -> Self {
+        let len = value.len();
+        assert!(len <= N, "slice is too large. Expected <={N} bytes, got {len}");
+        let mut bytes = Self::ZERO;
+        bytes[..len].copy_from_slice(value);
+        bytes
     }
 
     /// Returns a slice containing the entire array. Equivalent to `&s[..]`.
@@ -387,30 +530,34 @@ impl<const N: usize> FixedBytes<N> {
         &mut self.0
     }
 
-    /// Returns `true` if all bits set in `b` are also set in `self`.
+    /// Returns `true` if all bits set in `self` are also set in `b`.
     #[inline]
-    pub fn covers(&self, b: &Self) -> bool {
-        &(*b & *self) == b
+    pub fn covers(&self, other: &Self) -> bool {
+        (*self & *other) == *other
+    }
+
+    /// Returns `true` if all bits set in `self` are also set in `b`.
+    pub const fn const_covers(self, other: Self) -> bool {
+        // (self & other) == other
+        other.const_eq(&self.bit_and(other))
+    }
+
+    /// Compile-time equality. NOT constant-time equality.
+    pub const fn const_eq(&self, other: &Self) -> bool {
+        let mut i = 0;
+        while i < N {
+            if self.0[i] != other.0[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 
     /// Returns `true` if no bits are set.
     #[inline]
     pub fn is_zero(&self) -> bool {
         *self == Self::ZERO
-    }
-
-    /// Compile-time equality. NOT constant-time equality.
-    #[inline]
-    pub const fn const_eq(&self, other: &Self) -> bool {
-        let mut i = 0;
-        while i < N {
-            if self.0[i] != other.0[i] {
-                return false
-            }
-            i += 1;
-        }
-
-        true
     }
 
     /// Returns `true` if no bits are set.
@@ -454,12 +601,9 @@ impl<const N: usize> FixedBytes<N> {
 
     fn fmt_hex<const UPPER: bool>(&self, f: &mut fmt::Formatter<'_>, prefix: bool) -> fmt::Result {
         let mut buf = hex::Buffer::<N, true>::new();
-        let s = if UPPER {
-            buf.format_upper(self)
-        } else {
-            buf.format(self)
-        };
-        f.write_str(&s[(!prefix as usize) * 2..])
+        let s = if UPPER { buf.format_upper(self) } else { buf.format(self) };
+        // SAFETY: The buffer is guaranteed to be at least 2 bytes in length.
+        f.write_str(unsafe { s.get_unchecked((!prefix as usize) * 2..) })
     }
 }
 
@@ -518,5 +662,37 @@ mod tests {
             "{:X}", "0123456789abcdef" => "0123456789ABCDEF";
             "{:#X}", "0123456789abcdef" => "0x0123456789ABCDEF";
         }
+    }
+
+    #[test]
+    fn left_padding_from() {
+        assert_eq!(FixedBytes::<4>::left_padding_from(&[0x01, 0x23]), fixed_bytes!("00000123"));
+
+        assert_eq!(
+            FixedBytes::<4>::left_padding_from(&[0x01, 0x23, 0x45, 0x67]),
+            fixed_bytes!("01234567")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "slice is too large. Expected <=4 bytes, got 5")]
+    fn left_padding_from_too_large() {
+        FixedBytes::<4>::left_padding_from(&[0x01, 0x23, 0x45, 0x67, 0x89]);
+    }
+
+    #[test]
+    fn right_padding_from() {
+        assert_eq!(FixedBytes::<4>::right_padding_from(&[0x01, 0x23]), fixed_bytes!("01230000"));
+
+        assert_eq!(
+            FixedBytes::<4>::right_padding_from(&[0x01, 0x23, 0x45, 0x67]),
+            fixed_bytes!("01234567")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "slice is too large. Expected <=4 bytes, got 5")]
+    fn right_padding_from_too_large() {
+        FixedBytes::<4>::right_padding_from(&[0x01, 0x23, 0x45, 0x67, 0x89]);
     }
 }

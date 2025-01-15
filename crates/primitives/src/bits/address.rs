@@ -1,12 +1,12 @@
-use crate::{aliases::U160, utils::keccak256, wrap_fixed_bytes, FixedBytes};
+use crate::{aliases::U160, utils::keccak256, FixedBytes};
 use alloc::{
     borrow::Borrow,
     string::{String, ToString},
 };
-use core::{fmt, str};
+use core::{fmt, mem::MaybeUninit, str};
 
 /// Error type for address checksum validation.
-#[derive(Debug, Copy, Clone)]
+#[derive(Clone, Copy, Debug)]
 pub enum AddressError {
     /// Error while decoding hex.
     Hex(hex::FromHexError),
@@ -16,13 +16,22 @@ pub enum AddressError {
 }
 
 impl From<hex::FromHexError> for AddressError {
+    #[inline]
     fn from(value: hex::FromHexError) -> Self {
         Self::Hex(value)
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for AddressError {}
+impl core::error::Error for AddressError {
+    #[inline]
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            #[cfg(any(feature = "std", not(feature = "hex-compat")))]
+            Self::Hex(err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
 impl fmt::Display for AddressError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -38,9 +47,9 @@ wrap_fixed_bytes!(
     extra_derives: [],
     /// An Ethereum address, 20 bytes in length.
     ///
-    /// This type is separate from [`FixedBytes<20>`] and is declared with the
-    /// [`wrap_fixed_bytes!`] macro. This allows us to implement address-specific
-    /// functionality.
+    /// This type is separate from [`B160`](crate::B160) / [`FixedBytes<20>`]
+    /// and is declared with the [`wrap_fixed_bytes!`] macro. This allows us
+    /// to implement address-specific functionality.
     ///
     /// The main difference with the generic [`FixedBytes`] implementation is that
     /// [`Display`] formats the address using its [EIP-55] checksum
@@ -60,7 +69,7 @@ wrap_fixed_bytes!(
     /// use alloy_primitives::{address, Address};
     ///
     /// let checksummed = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
-    /// let expected = address!("d8da6bf26964af9d7eed9e03e53415d37aa96045");
+    /// let expected = address!("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
     /// let address = Address::parse_checksummed(checksummed, None).expect("valid checksum");
     /// assert_eq!(address, expected);
     ///
@@ -93,8 +102,8 @@ impl From<Address> for U160 {
 
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut buf = [0; 42];
-        let checksum = self.to_checksum_raw(&mut buf, None);
+        let checksum = self.to_checksum_buffer(None);
+        let checksum = checksum.as_str();
         if f.alternate() {
             // If the alternate flag is set, use middle-out compression
             // "0x" + first 4 bytes + "…" + last 4 bytes
@@ -115,11 +124,8 @@ impl Address {
     ///
     /// ```
     /// # use alloy_primitives::{address, b256, Address};
-    /// let word = b256!("000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045");
-    /// assert_eq!(
-    ///     Address::from_word(word),
-    ///     address!("d8da6bf26964af9d7eed9e03e53415d37aa96045")
-    /// );
+    /// let word = b256!("0x000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045");
+    /// assert_eq!(Address::from_word(word), address!("0xd8da6bf26964af9d7eed9e03e53415d37aa96045"));
     /// ```
     #[inline]
     #[must_use]
@@ -134,8 +140,8 @@ impl Address {
     /// ```
     /// # use alloy_primitives::{address, b256, Address};
     /// assert_eq!(
-    ///     address!("d8da6bf26964af9d7eed9e03e53415d37aa96045").into_word(),
-    ///     b256!("000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045"),
+    ///     address!("0xd8da6bf26964af9d7eed9e03e53415d37aa96045").into_word(),
+    ///     b256!("0x000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045"),
     /// );
     /// ```
     #[inline]
@@ -166,109 +172,31 @@ impl Address {
     /// # use alloy_primitives::{address, Address};
     /// let checksummed = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
     /// let address = Address::parse_checksummed(checksummed, None).unwrap();
-    /// let expected = address!("d8da6bf26964af9d7eed9e03e53415d37aa96045");
+    /// let expected = address!("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
     /// assert_eq!(address, expected);
     /// ```
     pub fn parse_checksummed<S: AsRef<str>>(
         s: S,
         chain_id: Option<u64>,
     ) -> Result<Self, AddressError> {
-        fn inner(s: &str, chain_id: Option<u64>) -> Result<Address, AddressError> {
+        fn parse_checksummed(s: &str, chain_id: Option<u64>) -> Result<Address, AddressError> {
             // checksummed addresses always start with the "0x" prefix
             if !s.starts_with("0x") {
-                return Err(AddressError::Hex(hex::FromHexError::InvalidStringLength))
+                return Err(AddressError::Hex(hex::FromHexError::InvalidStringLength));
             }
 
             let address: Address = s.parse()?;
-            let buf = &mut [0; 42];
-            let expected = address.to_checksum_raw(buf, chain_id);
-            if s == expected {
+            if s == address.to_checksum_buffer(chain_id).as_str() {
                 Ok(address)
             } else {
                 Err(AddressError::InvalidChecksum)
             }
         }
 
-        inner(s.as_ref(), chain_id)
+        parse_checksummed(s.as_ref(), chain_id)
     }
 
-    /// Encodes an Ethereum address to its [EIP-55] checksum.
-    ///
-    /// You can optionally specify an [EIP-155 chain ID] to encode the address
-    /// using [EIP-1191].
-    ///
-    /// [EIP-55]: https://eips.ethereum.org/EIPS/eip-55
-    /// [EIP-155 chain ID]: https://eips.ethereum.org/EIPS/eip-155
-    /// [EIP-1191]: https://eips.ethereum.org/EIPS/eip-1191
-    ///
-    /// # Panics
-    ///
-    /// This method panics if `buf` is not exactly 42 bytes long.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use alloy_primitives::{address, Address};
-    /// let address = address!("d8da6bf26964af9d7eed9e03e53415d37aa96045");
-    /// let mut buf = [0; 42];
-    ///
-    /// let checksummed: &str = address.to_checksum_raw(&mut buf, None);
-    /// assert_eq!(checksummed, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
-    ///
-    /// let checksummed: &str = address.to_checksum_raw(&mut buf, Some(1));
-    /// assert_eq!(checksummed, "0xD8Da6bf26964Af9d7EEd9e03e53415d37AA96045");
-    /// ```
-    #[must_use]
-    pub fn to_checksum_raw<'a>(&self, buf: &'a mut [u8], chain_id: Option<u64>) -> &'a str {
-        assert_eq!(buf.len(), 42, "addr_buf must be 42 bytes long");
-        buf[0] = b'0';
-        buf[1] = b'x';
-        hex::encode_to_slice(self, &mut buf[2..]).unwrap();
-
-        let mut storage;
-        let to_hash = match chain_id {
-            Some(chain_id) => {
-                // A decimal `u64` string is at most 20 bytes long
-                storage = [0u8; 2 + 40 + 20];
-
-                // Format the `chain_id` into a stack-allocated buffer using `itoa`
-                let mut temp = itoa::Buffer::new();
-                let prefix_str = temp.format(chain_id);
-                let prefix_len = prefix_str.len();
-                debug_assert!(prefix_len <= 20);
-                let len = 2 + 40 + prefix_len;
-
-                // SAFETY: prefix_len <= 20; len <= 62; storage.len() == 64
-                unsafe {
-                    storage
-                        .get_unchecked_mut(..prefix_len)
-                        .copy_from_slice(prefix_str.as_bytes());
-                    storage
-                        .get_unchecked_mut(prefix_len..len)
-                        .copy_from_slice(buf);
-                    storage.get_unchecked(..len)
-                }
-            }
-            None => &buf[2..],
-        };
-        let hash = keccak256(to_hash);
-        let mut hash_hex = [0u8; 64];
-        hex::encode_to_slice(hash, &mut hash_hex).unwrap();
-
-        // generates significantly less code than zipping the two arrays, or
-        // `.into_iter()`
-        for (i, x) in hash_hex.iter().enumerate().take(40) {
-            if *x >= b'8' {
-                // SAFETY: `addr_buf` is 42 bytes long, `2..42` is always in range
-                unsafe { buf.get_unchecked_mut(i + 2).make_ascii_uppercase() };
-            }
-        }
-
-        // SAFETY: All bytes in the buffer are valid UTF-8
-        unsafe { str::from_utf8_unchecked(buf) }
-    }
-
-    /// Encodes an Ethereum address to its [EIP-55] checksum.
+    /// Encodes an Ethereum address to its [EIP-55] checksum into a heap-allocated string.
     ///
     /// You can optionally specify an [EIP-155 chain ID] to encode the address
     /// using [EIP-1191].
@@ -281,7 +209,7 @@ impl Address {
     ///
     /// ```
     /// # use alloy_primitives::{address, Address};
-    /// let address = address!("d8da6bf26964af9d7eed9e03e53415d37aa96045");
+    /// let address = address!("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
     ///
     /// let checksummed: String = address.to_checksum(None);
     /// assert_eq!(checksummed, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
@@ -292,8 +220,112 @@ impl Address {
     #[inline]
     #[must_use]
     pub fn to_checksum(&self, chain_id: Option<u64>) -> String {
-        let mut buf = [0u8; 42];
-        self.to_checksum_raw(&mut buf, chain_id).to_string()
+        self.to_checksum_buffer(chain_id).as_str().into()
+    }
+
+    /// Encodes an Ethereum address to its [EIP-55] checksum into the given buffer.
+    ///
+    /// For convenience, the buffer is returned as a `&mut str`, as the bytes
+    /// are guaranteed to be valid UTF-8.
+    ///
+    /// You can optionally specify an [EIP-155 chain ID] to encode the address
+    /// using [EIP-1191].
+    ///
+    /// [EIP-55]: https://eips.ethereum.org/EIPS/eip-55
+    /// [EIP-155 chain ID]: https://eips.ethereum.org/EIPS/eip-155
+    /// [EIP-1191]: https://eips.ethereum.org/EIPS/eip-1191
+    ///
+    /// # Panics
+    ///
+    /// Panics if `buf` is not exactly 42 bytes long.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use alloy_primitives::{address, Address};
+    /// let address = address!("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
+    /// let mut buf = [0; 42];
+    ///
+    /// let checksummed: &mut str = address.to_checksum_raw(&mut buf, None);
+    /// assert_eq!(checksummed, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
+    ///
+    /// let checksummed: &mut str = address.to_checksum_raw(&mut buf, Some(1));
+    /// assert_eq!(checksummed, "0xD8Da6bf26964Af9d7EEd9e03e53415d37AA96045");
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn to_checksum_raw<'a>(&self, buf: &'a mut [u8], chain_id: Option<u64>) -> &'a mut str {
+        let buf: &mut [u8; 42] = buf.try_into().expect("buffer must be exactly 42 bytes long");
+        self.to_checksum_inner(buf, chain_id);
+        // SAFETY: All bytes in the buffer are valid UTF-8.
+        unsafe { str::from_utf8_unchecked_mut(buf) }
+    }
+
+    /// Encodes an Ethereum address to its [EIP-55] checksum into a stack-allocated buffer.
+    ///
+    /// You can optionally specify an [EIP-155 chain ID] to encode the address
+    /// using [EIP-1191].
+    ///
+    /// [EIP-55]: https://eips.ethereum.org/EIPS/eip-55
+    /// [EIP-155 chain ID]: https://eips.ethereum.org/EIPS/eip-155
+    /// [EIP-1191]: https://eips.ethereum.org/EIPS/eip-1191
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use alloy_primitives::{address, Address, AddressChecksumBuffer};
+    /// let address = address!("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
+    ///
+    /// let mut buffer: AddressChecksumBuffer = address.to_checksum_buffer(None);
+    /// assert_eq!(buffer.as_str(), "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
+    ///
+    /// let checksummed: &str = buffer.format(&address, Some(1));
+    /// assert_eq!(checksummed, "0xD8Da6bf26964Af9d7EEd9e03e53415d37AA96045");
+    /// ```
+    #[inline]
+    pub fn to_checksum_buffer(&self, chain_id: Option<u64>) -> AddressChecksumBuffer {
+        // SAFETY: The buffer is initialized by `format`.
+        let mut buf = unsafe { AddressChecksumBuffer::new() };
+        buf.format(self, chain_id);
+        buf
+    }
+
+    // https://eips.ethereum.org/EIPS/eip-55
+    // > In English, convert the address to hex, but if the `i`th digit is a letter (ie. it’s one of
+    // > `abcdef`) print it in uppercase if the `4*i`th bit of the hash of the lowercase hexadecimal
+    // > address is 1 otherwise print it in lowercase.
+    //
+    // https://eips.ethereum.org/EIPS/eip-1191
+    // > [...] If the chain id passed to the function belongs to a network that opted for using this
+    // > checksum variant, prefix the address with the chain id and the `0x` separator before
+    // > calculating the hash. [...]
+    #[allow(clippy::wrong_self_convention)]
+    fn to_checksum_inner(&self, buf: &mut [u8; 42], chain_id: Option<u64>) {
+        buf[0] = b'0';
+        buf[1] = b'x';
+        hex::encode_to_slice(self, &mut buf[2..]).unwrap();
+
+        let mut hasher = crate::Keccak256::new();
+        match chain_id {
+            Some(chain_id) => {
+                hasher.update(itoa::Buffer::new().format(chain_id).as_bytes());
+                // Clippy suggests an unnecessary copy.
+                #[allow(clippy::needless_borrows_for_generic_args)]
+                hasher.update(&*buf);
+            }
+            None => hasher.update(&buf[2..]),
+        }
+        let hash = hasher.finalize();
+
+        for (i, out) in buf[2..].iter_mut().enumerate() {
+            // This is made branchless for easier vectorization.
+            // Get the i-th nibble of the hash.
+            let hash_nibble = (hash[i / 2] >> (4 * (1 - i % 2))) & 0xf;
+            // Make the character ASCII uppercase if it's a hex letter and the hash nibble is >= 8.
+            // We can use a simpler comparison for checking if the character is a hex letter because
+            // we know `out` is a hex-encoded character (`b'0'..=b'9' | b'a'..=b'f'`).
+            *out ^= 0b0010_0000 * ((*out >= b'a') & (hash_nibble >= 8)) as u8;
+        }
     }
 
     /// Computes the `create` address for this address and nonce:
@@ -304,12 +336,12 @@ impl Address {
     ///
     /// ```
     /// # use alloy_primitives::{address, Address};
-    /// let sender = address!("b20a608c624Ca5003905aA834De7156C68b2E1d0");
+    /// let sender = address!("0xb20a608c624Ca5003905aA834De7156C68b2E1d0");
     ///
-    /// let expected = address!("00000000219ab540356cBB839Cbe05303d7705Fa");
+    /// let expected = address!("0x00000000219ab540356cBB839Cbe05303d7705Fa");
     /// assert_eq!(sender.create(0), expected);
     ///
-    /// let expected = address!("e33c6e89e69d085897f98e92b06ebd541d1daa99");
+    /// let expected = address!("0xe33c6e89e69d085897f98e92b06ebd541d1daa99");
     /// assert_eq!(sender.create(1), expected);
     /// ```
     #[cfg(feature = "rlp")]
@@ -356,10 +388,10 @@ impl Address {
     ///
     /// ```
     /// # use alloy_primitives::{address, b256, bytes, Address};
-    /// let address = address!("8ba1f109551bD432803012645Ac136ddd64DBA72");
-    /// let salt = b256!("7c5ea36004851c764c44143b1dcb59679b11c9a68e5f41497f6cf3d480715331");
+    /// let address = address!("0x8ba1f109551bD432803012645Ac136ddd64DBA72");
+    /// let salt = b256!("0x7c5ea36004851c764c44143b1dcb59679b11c9a68e5f41497f6cf3d480715331");
     /// let init_code = bytes!("6394198df16000526103ff60206004601c335afa6040516060f3");
-    /// let expected = address!("533ae9d683B10C02EbDb05471642F85230071FC3");
+    /// let expected = address!("0x533ae9d683B10C02EbDb05471642F85230071FC3");
     /// assert_eq!(address.create2_from_code(salt, init_code), expected);
     /// ```
     #[must_use]
@@ -387,10 +419,11 @@ impl Address {
     ///
     /// ```
     /// # use alloy_primitives::{address, b256, Address};
-    /// let address = address!("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f");
-    /// let salt = b256!("2b2f5776e38002e0c013d0d89828fdb06fee595ea2d5ed4b194e3883e823e350");
-    /// let init_code_hash = b256!("96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f");
-    /// let expected = address!("0d4a11d5EEaaC28EC3F61d100daF4d40471f1852");
+    /// let address = address!("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f");
+    /// let salt = b256!("0x2b2f5776e38002e0c013d0d89828fdb06fee595ea2d5ed4b194e3883e823e350");
+    /// let init_code_hash =
+    ///     b256!("0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f");
+    /// let expected = address!("0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852");
     /// assert_eq!(address.create2(salt, init_code_hash), expected);
     /// ```
     #[must_use]
@@ -415,27 +448,121 @@ impl Address {
         let hash = keccak256(bytes);
         Self::from_word(hash)
     }
+
+    /// Instantiate by hashing public key bytes.
+    ///
+    /// # Panics
+    ///
+    /// If the input is not exactly 64 bytes
+    pub fn from_raw_public_key(pubkey: &[u8]) -> Self {
+        assert_eq!(pubkey.len(), 64, "raw public key must be 64 bytes");
+        let digest = keccak256(pubkey);
+        Self::from_slice(&digest[12..])
+    }
+
+    /// Converts an ECDSA verifying key to its corresponding Ethereum address.
+    #[inline]
+    #[cfg(feature = "k256")]
+    #[doc(alias = "from_verifying_key")]
+    pub fn from_public_key(pubkey: &k256::ecdsa::VerifyingKey) -> Self {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        let affine: &k256::AffinePoint = pubkey.as_ref();
+        let encoded = affine.to_encoded_point(false);
+        Self::from_raw_public_key(&encoded.as_bytes()[1..])
+    }
+
+    /// Converts an ECDSA signing key to its corresponding Ethereum address.
+    #[inline]
+    #[cfg(feature = "k256")]
+    #[doc(alias = "from_signing_key")]
+    pub fn from_private_key(private_key: &k256::ecdsa::SigningKey) -> Self {
+        Self::from_public_key(private_key.verifying_key())
+    }
+}
+
+/// Stack-allocated buffer for efficiently computing address checksums.
+///
+/// See [`Address::to_checksum_buffer`] for more information.
+#[must_use]
+#[allow(missing_copy_implementations)]
+#[derive(Clone)]
+pub struct AddressChecksumBuffer(MaybeUninit<[u8; 42]>);
+
+impl fmt::Debug for AddressChecksumBuffer {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+impl fmt::Display for AddressChecksumBuffer {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+impl AddressChecksumBuffer {
+    /// Creates a new buffer.
+    ///
+    /// # Safety
+    ///
+    /// The buffer must be initialized with [`format`](Self::format) before use.
+    /// Prefer [`Address::to_checksum_buffer`] instead.
+    #[inline]
+    pub const unsafe fn new() -> Self {
+        Self(MaybeUninit::uninit())
+    }
+
+    /// Calculates the checksum of an address into the buffer.
+    ///
+    /// See [`Address::to_checksum_buffer`] for more information.
+    #[inline]
+    pub fn format(&mut self, address: &Address, chain_id: Option<u64>) -> &mut str {
+        address.to_checksum_inner(unsafe { self.0.assume_init_mut() }, chain_id);
+        self.as_mut_str()
+    }
+
+    /// Returns the checksum of a formatted address.
+    #[inline]
+    pub const fn as_str(&self) -> &str {
+        unsafe { str::from_utf8_unchecked(self.0.assume_init_ref()) }
+    }
+
+    /// Returns the checksum of a formatted address.
+    #[inline]
+    pub fn as_mut_str(&mut self) -> &mut str {
+        unsafe { str::from_utf8_unchecked_mut(self.0.assume_init_mut()) }
+    }
+
+    /// Returns the checksum of a formatted address.
+    #[inline]
+    #[allow(clippy::inherent_to_string_shadow_display)]
+    pub fn to_string(&self) -> String {
+        self.as_str().to_string()
+    }
+
+    /// Returns the backing buffer.
+    #[inline]
+    pub const fn into_inner(self) -> [u8; 42] {
+        unsafe { self.0.assume_init() }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hex_literal::hex;
+    use crate::hex;
 
     #[test]
     fn parse() {
         let expected = hex!("0102030405060708090a0b0c0d0e0f1011121314");
         assert_eq!(
-            "0102030405060708090a0b0c0d0e0f1011121314"
-                .parse::<Address>()
-                .unwrap()
-                .into_array(),
+            "0102030405060708090a0b0c0d0e0f1011121314".parse::<Address>().unwrap().into_array(),
             expected
         );
         assert_eq!(
-            "0x0102030405060708090a0b0c0d0e0f1011121314"
-                .parse::<Address>()
-                .unwrap(),
+            "0x0102030405060708090a0b0c0d0e0f1011121314".parse::<Address>().unwrap(),
             expected
         );
     }
@@ -528,9 +655,7 @@ mod tests {
     #[test]
     #[cfg(feature = "rlp")]
     fn create() {
-        let from = "0x6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0"
-            .parse::<Address>()
-            .unwrap();
+        let from = "0x6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0".parse::<Address>().unwrap();
         for (nonce, expected) in [
             "0xcd234a471b72ba2f1ccf0a70fcaba648a5eecd8d",
             "0x343c43a37d37dff08ae8c4a11544c718abb4fcf8",
@@ -547,17 +672,15 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "rlp", feature = "arbitrary"))]
+    #[cfg_attr(miri, ignore = "doesn't run in isolation and would take too long")]
     fn create_correctness() {
         fn create_slow(address: &Address, nonce: u64) -> Address {
             use alloy_rlp::Encodable;
 
             let mut out = vec![];
 
-            alloy_rlp::Header {
-                list: true,
-                payload_length: address.length() + nonce.length(),
-            }
-            .encode(&mut out);
+            alloy_rlp::Header { list: true, payload_length: address.length() + nonce.length() }
+                .encode(&mut out);
             address.encode(&mut out);
             nonce.encode(&mut out);
 
@@ -630,5 +753,14 @@ mod tests {
             assert_eq!(expected, from.create2(salt, init_code_hash));
             assert_eq!(expected, from.create2_from_code(salt, init_code));
         }
+    }
+
+    #[test]
+    fn test_raw_public_key_to_address() {
+        let addr = "0Ac1dF02185025F65202660F8167210A80dD5086".parse::<Address>().unwrap();
+
+        let pubkey_bytes = hex::decode("76698beebe8ee5c74d8cc50ab84ac301ee8f10af6f28d0ffd6adf4d6d3b9b762d46ca56d3dad2ce13213a6f42278dabbb53259f2d92681ea6a0b98197a719be3").unwrap();
+
+        assert_eq!(Address::from_raw_public_key(&pubkey_bytes), addr);
     }
 }

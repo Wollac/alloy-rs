@@ -1,6 +1,13 @@
+use crate::Expr;
 use proc_macro2::{TokenStream, TokenTree};
 use std::fmt;
-use syn::{parse::ParseStream, punctuated::Punctuated, Token};
+use syn::{parse::ParseStream, punctuated::Punctuated, Result, Token};
+
+/// Helper trait to parsing nested expressions.
+pub(crate) trait ParseNested: Sized {
+    /// Parse `Self` as an expression that starts with `expr`.
+    fn parse_nested(expr: Box<Expr>, input: ParseStream<'_>) -> Result<Self>;
+}
 
 #[repr(transparent)]
 pub(crate) struct DebugPunctuated<T, P>(Punctuated<T, P>);

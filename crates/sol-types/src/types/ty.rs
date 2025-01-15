@@ -1,98 +1,167 @@
-use crate::{token::TokenSeq, Result, TokenType, Word};
-use alloc::{borrow::Cow, string::String, vec::Vec};
+use crate::{
+    abi::{self, Token, TokenSeq},
+    private::SolTypeValue,
+    Result, Word,
+};
+use alloc::{borrow::Cow, vec::Vec};
 
-/// An encodable is any type that may be encoded via a given `SolType`.
-pub trait Encodable<T: ?Sized + SolType> {
-    /// Convert the value to tokens.
-    fn to_tokens(&self) -> T::TokenType<'_>;
-}
-
-/// A Solidity Type, for ABI encoding and decoding
+/// A Solidity type.
 ///
 /// This trait is implemented by types that contain ABI encoding and decoding
 /// info for Solidity types. Types may be combined to express arbitrarily
 /// complex Solidity types.
 ///
-/// ```
-/// use alloy_sol_types::{SolType, sol_data::*};
+/// These types are zero cost representations of Solidity types. They do not
+/// exist at runtime. They **only** contain information about the type, they do
+/// not carry any data.
 ///
-/// type DynUint256Array = Array<Uint<256>>;
-/// assert_eq!(&DynUint256Array::sol_type_name(), "uint256[]");
+/// # Implementer's Guide
+///
+/// It should not be necessary to implement this trait manually. Instead, use
+/// the [`sol!`] procedural macro to parse Solidity syntax into types that
+/// implement this trait.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```
+/// use alloy_sol_types::{sol_data::*, SolType};
+///
+/// type Uint256DynamicArray = Array<Uint<256>>;
+/// assert_eq!(Uint256DynamicArray::sol_type_name(), "uint256[]");
 ///
 /// type Erc20FunctionArgs = (Address, Uint<256>);
-/// assert_eq!(&Erc20FunctionArgs::sol_type_name(), "(address,uint256)");
+/// assert_eq!(Erc20FunctionArgs::sol_type_name(), "(address,uint256)");
 ///
 /// type LargeComplexType = (FixedArray<Array<Bool>, 2>, (FixedBytes<13>, String));
-/// assert_eq!(&LargeComplexType::sol_type_name(), "(bool[][2],(bytes13,string))");
+/// assert_eq!(LargeComplexType::sol_type_name(), "(bool[][2],(bytes13,string))");
 /// ```
 ///
-/// These types are zero cost representations of Solidity types. They do not
-/// exist at runtime. They ONLY contain information about the type, they do not
-/// carry any data.
-///
-/// ### Implementer's Guide
-///
-/// We do not recommend implementing this trait directly. Instead, we recommend
-/// using the [`crate::sol`] proc macro to parse a Solidity structdef into a
-/// native Rust struct.
+/// The previous example can be entirely replicated with the [`sol!`] macro:
 ///
 /// ```
-/// alloy_sol_types::sol! {
+/// use alloy_sol_types::{sol, SolType};
+///
+/// type Uint256DynamicArray = sol!(uint256[]);
+/// assert_eq!(Uint256DynamicArray::sol_type_name(), "uint256[]");
+///
+/// type Erc20FunctionArgs = sol!((address, uint256));
+/// assert_eq!(Erc20FunctionArgs::sol_type_name(), "(address,uint256)");
+///
+/// type LargeComplexType = sol!((bool[][2],(bytes13,string)));
+/// assert_eq!(LargeComplexType::sol_type_name(), "(bool[][2],(bytes13,string))");
+/// ```
+///
+/// For more complex usage, it's recommended to use the
+/// [`SolValue`](crate::SolValue) trait for primitive types, and the `Sol*`
+/// traits for other types created with [`sol!`]:
+///
+/// ```
+/// use alloy_primitives::Address;
+/// use alloy_sol_types::{sol, SolCall, SolStruct, SolValue};
+///
+/// sol! {
 ///     struct MyStruct {
 ///         bool a;
-///         bytes2 b;
+///         uint64 b;
+///         address c;
 ///     }
+///
+///     enum MyEnum {
+///         A,
+///         B,
+///         C,
+///     }
+///
+///     function myFunction(MyStruct my_struct, MyEnum my_enum);
 /// }
 ///
-/// // This is the native rust representation of a Solidity type!
-/// // How cool is that!
-/// const MY_STRUCT: MyStruct = MyStruct { a: true, b: [0x01, 0x02] };
+/// // `SolValue`
+/// let my_bool = true;
+/// let _ = my_bool.abi_encode();
+///
+/// let my_struct = MyStruct { a: true, b: 1, c: Address::ZERO };
+/// let _ = my_struct.abi_encode();
+///
+/// let my_enum = MyEnum::A;
+/// let _ = my_enum.abi_encode();
+///
+/// // `SolCall`
+/// let my_function_call = myFunctionCall { my_struct, my_enum };
+/// let _ = my_function_call.abi_encode();
 /// ```
-pub trait SolType {
+///
+/// [`sol!`]: crate::sol
+pub trait SolType: Sized {
     /// The corresponding Rust type.
-    type RustType: Encodable<Self> + 'static;
+    type RustType: SolTypeValue<Self> + 'static;
 
-    /// The corresponding ABI token type.
+    /// The corresponding [ABI token type](Token).
     ///
-    /// See implementers of [`TokenType`].
-    type TokenType<'a>: TokenType<'a>;
+    /// This is the intermediate representation of the type that is used for
+    /// ABI encoding and decoding.
+    type Token<'a>: Token<'a>;
 
-    /// The encoded size of the type, if known at compile time
-    const ENCODED_SIZE: Option<usize> = Some(32);
+    /// The name of this type in Solidity.
+    const SOL_NAME: &'static str;
 
-    /// Whether the encoded size is dynamic.
+    /// The statically-known ABI-encoded size of the type.
+    ///
+    /// If this is not known at compile time, this should be `None`, which indicates that the
+    /// encoded size is dynamic.
+    const ENCODED_SIZE: Option<usize>;
+
+    /// The statically-known Non-standard Packed Mode ABI-encoded size of the type.
+    ///
+    /// If this is not known at compile time, this should be `None`, which indicates that the
+    /// encoded size is dynamic.
+    const PACKED_ENCODED_SIZE: Option<usize>;
+
+    /// Whether the ABI-encoded size is dynamic.
+    ///
+    /// There should be no need to override the default implementation.
     const DYNAMIC: bool = Self::ENCODED_SIZE.is_none();
 
-    /// The name of the type in Solidity.
-    fn sol_type_name() -> Cow<'static, str>;
+    /// Returns the name of this type in Solidity.
+    #[deprecated(since = "0.6.3", note = "use `SOL_NAME` instead")]
+    #[inline]
+    fn sol_type_name() -> Cow<'static, str> {
+        Self::SOL_NAME.into()
+    }
 
-    /// Calculate the encoded size of the data, counting both head and tail
+    /// Calculate the ABI-encoded size of the data, counting both head and tail
     /// words. For a single-word type this will always be 32.
     #[inline]
-    fn encoded_size(_rust: &Self::RustType) -> usize {
-        Self::ENCODED_SIZE.unwrap()
+    fn abi_encoded_size<E: ?Sized + SolTypeValue<Self>>(rust: &E) -> usize {
+        rust.stv_abi_encoded_size()
     }
 
-    /// Check a token to see if it can be detokenized with this type.
-    fn type_check(token: &Self::TokenType<'_>) -> Result<()>;
+    /// Returns `true` if the given token can be detokenized with this type.
+    fn valid_token(token: &Self::Token<'_>) -> bool;
 
-    #[doc(hidden)]
-    fn type_check_fail(data: &[u8]) -> crate::Error {
-        crate::Error::type_check_fail(data, Self::sol_type_name())
-    }
-
-    /// Detokenize.
-    fn detokenize(token: Self::TokenType<'_>) -> Self::RustType;
-
-    /// Tokenize.
-    fn tokenize<E: Encodable<Self>>(rust: &E) -> Self::TokenType<'_> {
-        rust.to_tokens()
-    }
-
-    /// The encoded struct type (as EIP-712), if any. None for non-structs.
+    /// Returns an error if the given token cannot be detokenized with this
+    /// type.
     #[inline]
-    fn eip712_encode_type() -> Option<Cow<'static, str>> {
-        None
+    fn type_check(token: &Self::Token<'_>) -> Result<()> {
+        if Self::valid_token(token) {
+            Ok(())
+        } else {
+            Err(crate::Error::type_check_fail_token::<Self>(token))
+        }
+    }
+
+    /// Detokenize this type's value from the given token.
+    ///
+    /// See the [`abi::token`] module for more information.
+    fn detokenize(token: Self::Token<'_>) -> Self::RustType;
+
+    /// Tokenizes the given value into this type's token.
+    ///
+    /// See the [`abi::token`] module for more information.
+    #[inline]
+    fn tokenize<E: ?Sized + SolTypeValue<Self>>(rust: &E) -> Self::Token<'_> {
+        rust.stv_to_tokens()
     }
 
     /// Encode this data according to EIP-712 `encodeData` rules, and hash it
@@ -103,142 +172,118 @@ pub trait SolType {
     /// words for each element
     ///
     /// <https://eips.ethereum.org/EIPS/eip-712#definition-of-encodedata>
-    fn eip712_data_word(rust: &Self::RustType) -> Word;
+    #[inline]
+    fn eip712_data_word<E: ?Sized + SolTypeValue<Self>>(rust: &E) -> Word {
+        rust.stv_eip712_data_word()
+    }
+
+    /// Returns the length of this value when ABI-encoded in Non-standard Packed Mode.
+    ///
+    /// See [`abi_encode_packed`][SolType::abi_encode_packed] for more details.
+    #[inline]
+    fn abi_packed_encoded_size<E: ?Sized + SolTypeValue<Self>>(rust: &E) -> usize {
+        rust.stv_abi_packed_encoded_size()
+    }
 
     /// Non-standard Packed Mode ABI encoding.
     ///
-    /// See [`encode_packed`][SolType::encode_packed] for more details.
-    fn encode_packed_to(rust: &Self::RustType, out: &mut Vec<u8>);
+    /// See [`abi_encode_packed`][SolType::abi_encode_packed] for more details.
+    #[inline]
+    fn abi_encode_packed_to<E: ?Sized + SolTypeValue<Self>>(rust: &E, out: &mut Vec<u8>) {
+        rust.stv_abi_encode_packed_to(out)
+    }
 
     /// Non-standard Packed Mode ABI encoding.
     ///
     /// This is different from normal ABI encoding:
-    /// - types shorter than 32 bytes are concatenated directly, without padding
-    ///   or sign extension;
+    /// - types shorter than 32 bytes are concatenated directly, without padding or sign extension;
     /// - dynamic types are encoded in-place and without the length;
     /// - array elements are padded, but still encoded in-place.
     ///
     /// More information can be found in the [Solidity docs](https://docs.soliditylang.org/en/latest/abi-spec.html#non-standard-packed-mode).
     #[inline]
-    fn encode_packed(rust: &Self::RustType) -> Vec<u8> {
-        let mut out = Vec::new();
-        Self::encode_packed_to(rust, &mut out);
+    fn abi_encode_packed<E: ?Sized + SolTypeValue<Self>>(rust: &E) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::abi_packed_encoded_size(rust));
+        Self::abi_encode_packed_to(rust, &mut out);
         out
     }
 
-    /* BOILERPLATE BELOW */
-
-    /// Encode a single ABI token by wrapping it in a 1-length sequence.
+    /// Tokenizes and ABI-encodes the given value by wrapping it in a
+    /// single-element sequence.
+    ///
+    /// See the [`abi`] module for more information.
     #[inline]
-    fn encode_single(rust: &Self::RustType) -> Vec<u8> {
-        crate::encode_single(&rust.to_tokens())
+    fn abi_encode<E: ?Sized + SolTypeValue<Self>>(rust: &E) -> Vec<u8> {
+        abi::encode(&rust.stv_to_tokens())
     }
 
-    /// Encode an ABI sequence.
+    /// Tokenizes and ABI-encodes the given value as function parameters.
+    ///
+    /// See the [`abi`] module for more information.
     #[inline]
-    fn encode<'a>(rust: &'a Self::RustType) -> Vec<u8>
+    fn abi_encode_params<E: ?Sized + SolTypeValue<Self>>(rust: &E) -> Vec<u8>
     where
-        Self::TokenType<'a>: TokenSeq<'a>,
+        for<'a> Self::Token<'a>: TokenSeq<'a>,
     {
-        crate::encode(&rust.to_tokens())
+        abi::encode_params(&rust.stv_to_tokens())
     }
 
-    /// Encode an ABI sequence suitable for function parameters.
+    /// Tokenizes and ABI-encodes the given value as a sequence.
+    ///
+    /// See the [`abi`] module for more information.
     #[inline]
-    fn encode_params<'a>(rust: &'a Self::RustType) -> Vec<u8>
+    fn abi_encode_sequence<E: ?Sized + SolTypeValue<Self>>(rust: &E) -> Vec<u8>
     where
-        Self::TokenType<'a>: TokenSeq<'a>,
+        for<'a> Self::Token<'a>: TokenSeq<'a>,
     {
-        crate::encode_params(&rust.to_tokens())
+        abi::encode_sequence(&rust.stv_to_tokens())
     }
 
-    /// Hex output of [`encode`][SolType::encode].
+    /// Decodes this type's value from an ABI blob by interpreting it as a
+    /// single-element sequence.
+    ///
+    /// See the [`abi`] module for more information.
     #[inline]
-    fn hex_encode<'a>(rust: &'a Self::RustType) -> String
+    fn abi_decode(data: &[u8], validate: bool) -> Result<Self::RustType> {
+        abi::decode::<Self::Token<'_>>(data, validate)
+            .and_then(validate_and_detokenize::<Self>(validate))
+    }
+
+    /// Decodes this type's value from an ABI blob by interpreting it as
+    /// function parameters.
+    ///
+    /// See the [`abi`] module for more information.
+    #[inline]
+    fn abi_decode_params<'de>(data: &'de [u8], validate: bool) -> Result<Self::RustType>
     where
-        Self::TokenType<'a>: TokenSeq<'a>,
+        Self::Token<'de>: TokenSeq<'de>,
     {
-        hex::encode_prefixed(Self::encode(rust))
+        abi::decode_params::<Self::Token<'_>>(data, validate)
+            .and_then(validate_and_detokenize::<Self>(validate))
     }
 
-    /// Hex output of [`encode_single`][SolType::encode_single].
+    /// Decodes this type's value from an ABI blob by interpreting it as a
+    /// sequence.
+    ///
+    /// See the [`abi`] module for more information.
     #[inline]
-    fn hex_encode_single(rust: &Self::RustType) -> String {
-        hex::encode_prefixed(Self::encode_single(rust))
-    }
-
-    /// Hex output of [`encode_params`][SolType::encode_params].
-    #[inline]
-    fn hex_encode_params<'a>(rust: &'a Self::RustType) -> String
+    fn abi_decode_sequence<'de>(data: &'de [u8], validate: bool) -> Result<Self::RustType>
     where
-        Self::TokenType<'a>: TokenSeq<'a>,
+        Self::Token<'de>: TokenSeq<'de>,
     {
-        hex::encode_prefixed(Self::encode_params(rust))
+        abi::decode_sequence::<Self::Token<'_>>(data, validate)
+            .and_then(validate_and_detokenize::<Self>(validate))
     }
+}
 
-    /// Decode a Rust type from an ABI blob.
-    #[inline]
-    fn decode<'de>(data: &'de [u8], validate: bool) -> Result<Self::RustType>
-    where
-        Self::TokenType<'de>: TokenSeq<'de>,
-    {
-        let decoded = crate::decode::<Self::TokenType<'_>>(data, validate)?;
+#[inline]
+fn validate_and_detokenize<T: SolType>(
+    validate: bool,
+) -> impl FnOnce(T::Token<'_>) -> Result<T::RustType> {
+    move |token| {
         if validate {
-            Self::type_check(&decoded)?;
+            T::type_check(&token)?;
         }
-        Ok(Self::detokenize(decoded))
-    }
-
-    /// Decode a Rust type from an ABI blob.
-    #[inline]
-    fn decode_params(data: &[u8], validate: bool) -> Result<Self::RustType>
-    where
-        for<'de> Self::TokenType<'de>: TokenSeq<'de>,
-    {
-        let decoded = crate::decode_params::<Self::TokenType<'_>>(data, validate)?;
-        if validate {
-            Self::type_check(&decoded)?;
-        }
-        Ok(Self::detokenize(decoded))
-    }
-
-    /// Decode a Rust type from an ABI blob.
-    #[inline]
-    fn decode_single(data: &[u8], validate: bool) -> Result<Self::RustType> {
-        let decoded = crate::decode_single::<Self::TokenType<'_>>(data, validate)?;
-        if validate {
-            Self::type_check(&decoded)?;
-        }
-        Ok(Self::detokenize(decoded))
-    }
-
-    /// Decode a Rust type from a hex-encoded ABI blob.
-    #[inline]
-    fn hex_decode(data: &str, validate: bool) -> Result<Self::RustType>
-    where
-        for<'de> Self::TokenType<'de>: TokenSeq<'de>,
-    {
-        hex::decode(data)
-            .map_err(Into::into)
-            .and_then(|buf| Self::decode(&buf, validate))
-    }
-
-    /// Decode a Rust type from a hex-encoded ABI blob.
-    #[inline]
-    fn hex_decode_single(data: &str, validate: bool) -> Result<Self::RustType> {
-        hex::decode(data)
-            .map_err(Into::into)
-            .and_then(|buf| Self::decode_single(&buf, validate))
-    }
-
-    /// Decode a Rust type from a hex-encoded ABI blob.
-    #[inline]
-    fn hex_decode_params(data: &str, validate: bool) -> Result<Self::RustType>
-    where
-        for<'de> Self::TokenType<'de>: TokenSeq<'de>,
-    {
-        hex::decode(data)
-            .map_err(Into::into)
-            .and_then(|buf| Self::decode_params(&buf, validate))
+        Ok(T::detokenize(token))
     }
 }

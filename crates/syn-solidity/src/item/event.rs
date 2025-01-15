@@ -1,4 +1,7 @@
-use crate::{kw, utils::DebugPunctuated, ParameterList, SolIdent, Type, VariableDeclaration};
+use crate::{
+    kw, utils::DebugPunctuated, ParameterList, SolIdent, SolPath, Spanned, Type,
+    VariableDeclaration,
+};
 use proc_macro2::Span;
 use std::fmt;
 use syn::{
@@ -20,13 +23,30 @@ pub struct ItemEvent {
     pub semi_token: Token![;],
 }
 
+impl fmt::Display for ItemEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "event {}(", self.name)?;
+        for (i, param) in self.parameters.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            param.fmt(f)?;
+        }
+        f.write_str(")")?;
+        if self.is_anonymous() {
+            f.write_str(" anonymous")?;
+        }
+        f.write_str(";")
+    }
+}
+
 impl fmt::Debug for ItemEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ItemEvent")
             .field("attrs", &self.attrs)
             .field("name", &self.name)
             .field("arguments", DebugPunctuated::new(&self.parameters))
-            .field("anonymous", &self.anonymous.is_some())
+            .field("anonymous", &self.is_anonymous())
             .finish()
     }
 }
@@ -46,15 +66,17 @@ impl Parse for ItemEvent {
     }
 }
 
-impl ItemEvent {
-    pub fn span(&self) -> Span {
+impl Spanned for ItemEvent {
+    fn span(&self) -> Span {
         self.name.span()
     }
 
-    pub fn set_span(&mut self, span: Span) {
+    fn set_span(&mut self, span: Span) {
         self.name.set_span(span);
     }
+}
 
+impl ItemEvent {
     /// Returns `true` if the event is anonymous.
     #[inline]
     pub const fn is_anonymous(&self) -> bool {
@@ -97,10 +119,31 @@ impl ItemEvent {
     }
 
     pub fn params(&self) -> ParameterList {
-        self.parameters
-            .iter()
-            .map(EventParameter::as_param)
-            .collect()
+        self.parameters.iter().map(EventParameter::as_param).collect()
+    }
+
+    pub fn param_types(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &Type> + DoubleEndedIterator + Clone {
+        self.parameters.iter().map(|var| &var.ty)
+    }
+
+    pub fn param_types_mut(
+        &mut self,
+    ) -> impl ExactSizeIterator<Item = &mut Type> + DoubleEndedIterator {
+        self.parameters.iter_mut().map(|var| &mut var.ty)
+    }
+
+    pub fn param_types_and_names(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&Type, Option<&SolIdent>)> + DoubleEndedIterator {
+        self.parameters.iter().map(|p| (&p.ty, p.name.as_ref()))
+    }
+
+    pub fn param_type_strings(
+        &self,
+    ) -> impl ExactSizeIterator<Item = String> + DoubleEndedIterator + Clone + '_ {
+        self.parameters.iter().map(|var| var.ty.to_string())
     }
 
     pub fn non_indexed_params(&self) -> impl Iterator<Item = &EventParameter> {
@@ -109,10 +152,6 @@ impl ItemEvent {
 
     pub fn indexed_params(&self) -> impl Iterator<Item = &EventParameter> {
         self.parameters.iter().filter(|p| p.is_indexed())
-    }
-
-    pub fn dynamic_params(&self) -> impl Iterator<Item = &EventParameter> {
-        self.parameters.iter().filter(|p| p.is_abi_dynamic())
     }
 
     pub fn as_type(&self) -> Type {
@@ -133,6 +172,19 @@ pub struct EventParameter {
     pub name: Option<SolIdent>,
 }
 
+impl fmt::Display for EventParameter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.ty.fmt(f)?;
+        if self.indexed.is_some() {
+            f.write_str(" indexed")?;
+        }
+        if let Some(name) = &self.name {
+            write!(f, " {name}")?;
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Debug for EventParameter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EventParameter")
@@ -150,27 +202,20 @@ impl Parse for EventParameter {
             attrs: input.call(Attribute::parse_outer)?,
             ty: input.parse()?,
             indexed: input.parse()?,
-            name: if SolIdent::peek_any(input) {
-                Some(input.parse()?)
-            } else {
-                None
-            },
+            name: if SolIdent::peek_any(input) { Some(input.parse()?) } else { None },
         })
     }
 }
 
-impl EventParameter {
+impl Spanned for EventParameter {
     /// Get the span of the event parameter
-    pub fn span(&self) -> Span {
+    fn span(&self) -> Span {
         let span = self.ty.span();
-        self.name
-            .as_ref()
-            .and_then(|name| span.join(name.span()))
-            .unwrap_or(span)
+        self.name.as_ref().and_then(|name| span.join(name.span())).unwrap_or(span)
     }
 
     /// Sets the span of the event parameter.
-    pub fn set_span(&mut self, span: Span) {
+    fn set_span(&mut self, span: Span) {
         self.ty.set_span(span);
         if let Some(kw) = &mut self.indexed {
             kw.span = span;
@@ -179,7 +224,9 @@ impl EventParameter {
             name.set_span(span);
         }
     }
+}
 
+impl EventParameter {
     /// Convert to a parameter declaration.
     pub fn as_param(&self) -> VariableDeclaration {
         VariableDeclaration {
@@ -202,17 +249,14 @@ impl EventParameter {
         self.indexed.is_none()
     }
 
-    /// Returns true if the event parameter is a dynamically sized type.
-    pub fn is_abi_dynamic(&self) -> bool {
-        self.ty.is_abi_dynamic()
-    }
-
     /// Returns `true` if the event parameter is indexed and dynamically sized.
     /// These types are hashed, and then stored in the topics as specified in
     /// [the Solidity spec][ref].
     ///
+    /// `custom_is_value_type` accounts for custom value types.
+    ///
     /// [ref]: https://docs.soliditylang.org/en/latest/abi-spec.html#events
-    pub fn indexed_as_hash(&self) -> bool {
-        self.is_indexed() && self.is_abi_dynamic()
+    pub fn indexed_as_hash(&self, custom_is_value_type: impl Fn(&SolPath) -> bool) -> bool {
+        self.is_indexed() && !self.ty.is_value_type(custom_is_value_type)
     }
 }

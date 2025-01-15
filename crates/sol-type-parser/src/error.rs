@@ -1,43 +1,73 @@
-use alloc::string::{String, ToString};
+use alloc::{boxed::Box, string::String};
 use core::fmt;
 
-/// Type string parsing result
-pub type Result<T> = core::result::Result<T, Error>;
+/// Parser result
+pub type Result<T, E = Error> = core::result::Result<T, E>;
 
-/// A type string parsing error.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Error {
-    /// Invalid type string, extra chars, or invalid structure.
-    InvalidTypeString(String),
-    /// Invalid size for a primitive type (intX, uintX, or bytesX).
-    InvalidSize(String),
+/// Parser error.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Error(Repr);
+
+impl core::error::Error for Error {}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Error").field(&self.0 .0).finish()
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 impl Error {
+    /// Instantiate a new error.
+    pub fn new(s: impl fmt::Display) -> Self {
+        Self::_new("", &s)
+    }
+
+    /// Instantiate a new parser error.
+    pub fn parser(e: impl fmt::Display) -> Self {
+        Self::_new(if cfg!(feature = "std") { "parser error:\n" } else { "parser error: " }, &e)
+    }
+
     /// Instantiate an invalid type string error. Invalid type string errors are
     /// for type strings that are not valid type strings. E.g. "uint256))))[".
-    #[inline(always)]
-    pub fn invalid_type_string(ty: impl ToString) -> Self {
-        Self::InvalidTypeString(ty.to_string())
+    pub fn invalid_type_string(ty: impl fmt::Display) -> Self {
+        Self::_new("invalid type string: ", &ty)
+    }
+
+    /// Instantiate an invalid identifier string error. Invalid identifier string errors are for
+    /// identifier strings that do not follow the format described in
+    /// <https://docs.soliditylang.org/en/latest/grammar.html#a4.SolidityLexer.Identifier>.
+    pub fn invalid_identifier_string(identifier: impl fmt::Display) -> Self {
+        Self::_new("invalid identifier string: ", &identifier)
     }
 
     /// Instantiate an invalid size error. Invalid size errors are for valid
     /// primitive types with invalid sizes. E.g. `"uint7"` or `"bytes1337"` or
     /// `"string[aaaaaa]"`.
-    #[inline(always)]
-    pub fn invalid_size(ty: impl ToString) -> Self {
-        Self::InvalidSize(ty.to_string())
+    pub fn invalid_size(ty: impl fmt::Display) -> Self {
+        Self::_new("invalid size for type: ", &ty)
+    }
+
+    // Not public API.
+    #[doc(hidden)]
+    #[inline(never)]
+    #[cold]
+    pub fn _new(s: &str, e: &dyn fmt::Display) -> Self {
+        Self(Repr(Box::new(format!("{s}{e}"))))
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {}
+#[derive(Clone, PartialEq, Eq)]
+#[allow(clippy::box_collection)] // `Box<String>` is smaller than `String` or `Box<str>`.
+struct Repr(Box<String>);
 
-impl fmt::Display for Error {
+impl fmt::Display for Repr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidTypeString(s) => write!(f, "Invalid type string: {s}"),
-            Self::InvalidSize(ty) => write!(f, "Invalid size for type: {ty}"),
-        }
+        f.write_str(&self.0)
     }
 }

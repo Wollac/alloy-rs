@@ -1,4 +1,4 @@
-use crate::{kw, utils::DebugPunctuated, Type};
+use crate::{kw, utils::DebugPunctuated, Spanned, Type};
 use proc_macro2::Span;
 use std::{
     fmt,
@@ -34,14 +34,6 @@ impl Hash for TypeTuple {
     }
 }
 
-impl fmt::Debug for TypeTuple {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("TypeTuple")
-            .field(DebugPunctuated::new(&self.types))
-            .finish()
-    }
-}
-
 impl fmt::Display for TypeTuple {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("(")?;
@@ -51,7 +43,16 @@ impl fmt::Display for TypeTuple {
             }
             ty.fmt(f)?;
         }
+        if self.types.len() == 1 {
+            f.write_str(",")?;
+        }
         f.write_str(")")
+    }
+}
+
+impl fmt::Debug for TypeTuple {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("TypeTuple").field(DebugPunctuated::new(&self.types)).finish()
     }
 }
 
@@ -64,10 +65,7 @@ impl Parse for TypeTuple {
             types: content.parse_terminated(Type::parse, Token![,])?,
         };
         match this.types.len() {
-            0 => Err(Error::new(
-                this.paren_token.span.join(),
-                "empty tuples are not allowed",
-            )),
+            0 => Err(Error::new(this.paren_token.span.join(), "empty tuples are not allowed")),
             1 if !this.types.trailing_punct() => Err(Error::new(
                 this.paren_token.span.close(),
                 "single element tuples must have a trailing comma",
@@ -79,14 +77,14 @@ impl Parse for TypeTuple {
 
 impl FromIterator<Type> for TypeTuple {
     fn from_iter<T: IntoIterator<Item = Type>>(iter: T) -> Self {
-        TypeTuple {
+        Self {
             tuple_token: None,
             paren_token: Paren::default(),
             types: {
                 let mut types = iter.into_iter().collect::<Punctuated<_, _>>();
                 // ensure trailing comma for single item tuple
                 if !types.trailing_punct() && types.len() == 1 {
-                    types.push_punct(Default::default())
+                    types.push_punct(Default::default());
                 }
                 types
             },
@@ -94,21 +92,21 @@ impl FromIterator<Type> for TypeTuple {
     }
 }
 
-impl TypeTuple {
-    pub fn span(&self) -> Span {
+impl Spanned for TypeTuple {
+    fn span(&self) -> Span {
         let span = self.paren_token.span.join();
-        self.tuple_token
-            .and_then(|tuple_token| tuple_token.span.join(span))
-            .unwrap_or(span)
+        self.tuple_token.and_then(|tuple_token| tuple_token.span.join(span)).unwrap_or(span)
     }
 
-    pub fn set_span(&mut self, span: Span) {
+    fn set_span(&mut self, span: Span) {
         if let Some(tuple_token) = &mut self.tuple_token {
             tuple_token.span = span;
         }
         self.paren_token = Paren(span);
     }
+}
 
+impl TypeTuple {
     /// See [`Type::is_abi_dynamic`].
     pub fn is_abi_dynamic(&self) -> bool {
         self.types.iter().any(Type::is_abi_dynamic)

@@ -1,15 +1,11 @@
 use crate::{
     internal_type::BorrowedInternalType,
-    utils::{validate_identifier, validate_ty},
+    utils::{mk_eparam, mk_param, validate_identifier},
     InternalType,
 };
-use alloc::{
-    borrow::{Cow, ToOwned},
-    string::String,
-    vec::Vec,
-};
-use alloy_sol_type_parser::TypeSpecifier;
-use core::fmt;
+use alloc::{borrow::Cow, string::String, vec::Vec};
+use core::{fmt, str::FromStr};
+use parser::{Error, ParameterSpecifier, TypeSpecifier};
 use serde::{de::Unexpected, Deserialize, Deserializer, Serialize, Serializer};
 
 /// JSON specification of a parameter.
@@ -21,60 +17,114 @@ use serde::{de::Unexpected, Deserialize, Deserializer, Serialize, Serializer};
 /// [Error]: crate::Error
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Param {
-    /// The name of the parameter. This field always contains either the empty
-    /// string, or a valid Solidity identifier.
-    pub name: String,
     /// The canonical Solidity type of the parameter, using the word "tuple" to
     /// represent complex types. E.g. `uint256` or `bytes[2]` or `tuple` or
-    /// `tuple[2]`. This field always contains a valid
-    /// [`alloy_sol_type_parser::TypeSpecifier`].
+    /// `tuple[2]`.
+    ///
+    /// Generally, this is a valid [`TypeSpecifier`], but in very rare
+    /// circumstances, such as when a function in a library contains an enum
+    /// in its parameters or return types, this will be `Contract.EnumName`
+    /// instead of the actual type (`uint8`).
+    /// Visible for macros, functions inside the crate, and doc tests. It is not recommended to
+    /// instantiate directly. Use Param::new instead.
+    #[doc(hidden)]
     pub ty: String,
-    /// If the paramaeter is a compound type (a struct or tuple), a list of the
+    /// The name of the parameter. This field always contains either the empty
+    /// string, or a valid Solidity identifier.
+    /// Visible for macros, functions inside the crate, and doc tests. It is not recommended to
+    /// instantiate directly. Use Param::new instead.
+    #[doc(hidden)]
+    pub name: String,
+    /// If the parameter is a compound type (a struct or tuple), a list of the
     /// parameter's components, in order. Empty otherwise
     pub components: Vec<Param>,
     /// The internal type of the parameter. This type represents the type that
-    /// the author of the solidity contract specified. E.g. for a contract, this
+    /// the author of the Solidity contract specified. E.g. for a contract, this
     /// will be `contract MyContract` while the `type` field will be `address`.
     pub internal_type: Option<InternalType>,
 }
 
 impl fmt::Display for Param {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(internal_type) = &self.internal_type {
-            write!(f, "{} ", internal_type)?;
-        }
+        if let Some(it) = &self.internal_type { it.fmt(f) } else { f.write_str(&self.ty) }?;
+        f.write_str(" ")?;
         f.write_str(&self.name)
     }
 }
 
 impl<'de> Deserialize<'de> for Param {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        BorrowedParam::deserialize(deserializer).and_then(|inner| {
+        ParamInner::deserialize(deserializer).and_then(|inner| {
             if inner.indexed.is_none() {
-                validate_identifier!(inner.name);
-                validate_ty!(inner.ty);
+                inner.validate_fields()?;
                 Ok(Self {
-                    name: inner.name.to_owned(),
-                    ty: inner.ty.to_owned(),
-                    internal_type: inner.internal_type.map(Into::into),
-                    components: inner.components.into_owned(),
+                    name: inner.name,
+                    ty: inner.ty,
+                    internal_type: inner.internal_type,
+                    components: inner.components,
                 })
             } else {
-                Err(serde::de::Error::custom(
-                    "indexed is not supported in params",
-                ))
+                Err(serde::de::Error::custom("indexed is not supported in params"))
             }
         })
     }
 }
 
 impl Serialize for Param {
+    #[inline]
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.as_inner().serialize(serializer)
     }
 }
 
+impl FromStr for Param {
+    type Err = parser::Error;
+
+    #[inline]
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
 impl Param {
+    /// Parse a parameter from a Solidity parameter string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use alloy_json_abi::Param;
+    /// assert_eq!(
+    ///     Param::parse("uint256[] foo"),
+    ///     Ok(Param {
+    ///         name: "foo".into(),
+    ///         ty: "uint256[]".into(),
+    ///         components: vec![],
+    ///         internal_type: None,
+    ///     })
+    /// );
+    /// ```
+    pub fn parse(input: &str) -> parser::Result<Self> {
+        ParameterSpecifier::parse(input).map(|p| mk_param(p.name, p.ty))
+    }
+
+    /// Validate and create new instance of Param.
+    pub fn new(
+        name: &str,
+        ty: &str,
+        components: Vec<Self>,
+        internal_type: Option<InternalType>,
+    ) -> parser::Result<Self> {
+        Self::validate_fields(name, ty, !components.is_empty())?;
+        Ok(Self { ty: ty.into(), name: name.into(), components, internal_type })
+    }
+
+    /// The name of the parameter. This function always returns either an empty
+    /// slice, or a valid Solidity identifier.
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// The internal type of the parameter.
     #[inline]
     pub const fn internal_type(&self) -> Option<&InternalType> {
@@ -131,7 +181,7 @@ impl Param {
     pub fn udt_specifier(&self) -> Option<TypeSpecifier<'_>> {
         // UDTs are more annoying to check for, so we reuse logic here.
         if !self.is_udt() {
-            return None
+            return None;
         }
         self.internal_type().and_then(|ty| ty.other_specifier())
     }
@@ -143,6 +193,7 @@ impl Param {
     pub fn struct_specifier(&self) -> Option<TypeSpecifier<'_>> {
         self.internal_type().and_then(|ty| ty.struct_specifier())
     }
+
     /// The enum specifier is a [`TypeSpecifier`] containing the enum name and
     /// any array sizes. It is computed from the `internal_type`. If this param
     /// is not a enum, this function will return `None`.
@@ -177,9 +228,29 @@ impl Param {
     #[inline]
     pub fn selector_type_raw(&self, s: &mut String) {
         if self.components.is_empty() {
-            s.push_str(&self.ty)
+            s.push_str(&self.ty);
         } else {
-            crate::utils::signature_raw("", &self.components, s);
+            crate::utils::params_abi_tuple(&self.components, s);
+            // checked during deserialization, but might be invalid from a user
+            if let Some(suffix) = self.ty.strip_prefix("tuple") {
+                s.push_str(suffix);
+            }
+        }
+    }
+
+    /// Formats the canonical type of this parameter into the given string including then names of
+    /// the params.
+    #[inline]
+    pub fn full_selector_type_raw(&self, s: &mut String) {
+        if self.components.is_empty() {
+            s.push_str(&self.ty);
+        } else {
+            s.push_str("tuple");
+            crate::utils::params_tuple(&self.components, s);
+            // checked during deserialization, but might be invalid from a user
+            if let Some(suffix) = self.ty.strip_prefix("tuple") {
+                s.push_str(suffix);
+            }
         }
     }
 
@@ -191,23 +262,46 @@ impl Param {
         if self.components.is_empty() {
             Cow::Borrowed(&self.ty)
         } else {
-            Cow::Owned(crate::utils::signature("", &self.components))
+            let mut s = String::with_capacity(self.components.len() * 32);
+            self.selector_type_raw(&mut s);
+            Cow::Owned(s)
         }
     }
 
+    #[inline]
     fn borrowed_internal_type(&self) -> Option<BorrowedInternalType<'_>> {
         self.internal_type().as_ref().map(|it| it.as_borrowed())
     }
 
     #[inline]
-    fn as_inner(&self) -> BorrowedParam<'_, Param> {
-        BorrowedParam {
+    fn as_inner(&self) -> BorrowedParamInner<'_> {
+        BorrowedParamInner {
             name: &self.name,
             ty: &self.ty,
             indexed: None,
             internal_type: self.borrowed_internal_type(),
             components: Cow::Borrowed(&self.components),
         }
+    }
+
+    #[inline]
+    fn validate_fields(name: &str, ty: &str, has_components: bool) -> parser::Result<()> {
+        if !name.is_empty() && !parser::is_valid_identifier(name) {
+            return Err(Error::invalid_identifier_string(name));
+        }
+
+        // any components means type is "tuple" + maybe brackets, so we can skip
+        // parsing with TypeSpecifier
+        if !has_components {
+            parser::TypeSpecifier::parse(ty)?;
+        } else {
+            // https://docs.soliditylang.org/en/latest/abi-spec.html#handling-tuple-types
+            // checking for "tuple" prefix should be enough
+            if !ty.starts_with("tuple") {
+                return Err(Error::invalid_type_string(ty));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -217,66 +311,113 @@ impl Param {
 /// `indexed` field.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct EventParam {
-    /// The name of the parameter. This field always contains either the empty
-    /// string, or a valid Solidity identifier.
-    pub name: String,
     /// The canonical Solidity type of the parameter, using the word "tuple" to
     /// represent complex types. E.g. `uint256` or `bytes[2]` or `tuple` or
-    /// `tuple[2]`. This field always contains a valid
-    /// [`alloy_sol_type_parser::TypeSpecifier`].
+    /// `tuple[2]`.
+    ///
+    /// Generally, this is a valid [`TypeSpecifier`], but in very rare
+    /// circumstances, such as when a function in a library contains an enum
+    /// in its parameters or return types, this will be `Contract.EnumName`
+    /// instead of the actual type (`uint8`).
+    /// Visible for macros, functions inside the crate, and doc tests. It is not recommended to
+    /// instantiate directly. Use Param::new instead.
+    #[doc(hidden)]
     pub ty: String,
+    /// The name of the parameter. This field always contains either the empty
+    /// string, or a valid Solidity identifier.
+    /// Visible for macros, functions inside the crate, and doc tests. It is not recommended to
+    /// instantiate directly. Use Param::new instead.
+    #[doc(hidden)]
+    pub name: String,
     /// Whether the parameter is indexed. Indexed parameters have their
     /// value, or the hash of their value, stored in the log topics.
     pub indexed: bool,
-    /// If the paramaeter is a compound type (a struct or tuple), a list of the
+    /// If the parameter is a compound type (a struct or tuple), a list of the
     /// parameter's components, in order. Empty otherwise. Because the
     /// components are not top-level event params, they will not have an
     /// `indexed` field.
     pub components: Vec<Param>,
     /// The internal type of the parameter. This type represents the type that
-    /// the author of the solidity contract specified. E.g. for a contract, this
+    /// the author of the Solidity contract specified. E.g. for a contract, this
     /// will be `contract MyContract` while the `type` field will be `address`.
     pub internal_type: Option<InternalType>,
 }
 
 impl fmt::Display for EventParam {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(internal_type) = &self.internal_type {
-            write!(f, "{} ", internal_type)?;
-        }
+        if let Some(it) = &self.internal_type { it.fmt(f) } else { f.write_str(&self.ty) }?;
+        f.write_str(" ")?;
         f.write_str(&self.name)
     }
 }
 
 impl<'de> Deserialize<'de> for EventParam {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        BorrowedParam::deserialize(deserializer).and_then(|gp| {
-            if let Some(indexed) = gp.indexed {
-                validate_identifier!(gp.name);
-                validate_ty!(gp.ty);
-                Ok(Self {
-                    name: gp.name.to_owned(),
-                    ty: gp.ty.to_owned(),
-                    indexed,
-                    internal_type: gp.internal_type.map(Into::into),
-                    components: gp.components.into_owned(),
-                })
-            } else {
-                Err(serde::de::Error::custom(
-                    "indexed is required in event params",
-                ))
-            }
+        ParamInner::deserialize(deserializer).and_then(|inner| {
+            inner.validate_fields()?;
+            Ok(Self {
+                name: inner.name,
+                ty: inner.ty,
+                indexed: inner.indexed.unwrap_or(false),
+                internal_type: inner.internal_type,
+                components: inner.components,
+            })
         })
     }
 }
 
 impl Serialize for EventParam {
+    #[inline]
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.as_inner().serialize(serializer)
     }
 }
 
+impl FromStr for EventParam {
+    type Err = parser::Error;
+
+    #[inline]
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
 impl EventParam {
+    /// Parse an event parameter from a Solidity parameter string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::panic::catch_unwind;
+    /// use alloy_json_abi::EventParam;
+    /// assert_eq!(
+    ///     EventParam::parse("uint256[] indexed foo"),
+    ///     Ok(EventParam {
+    ///         name: "foo".into(),
+    ///         ty: "uint256[]".into(),
+    ///         indexed: true,
+    ///         components: vec![],
+    ///         internal_type: None,
+    ///     })
+    /// );
+    /// ```
+    #[inline]
+    pub fn parse(input: &str) -> parser::Result<Self> {
+        ParameterSpecifier::parse(input).map(mk_eparam)
+    }
+
+    /// Validate and create new instance of EventParam
+    pub fn new(
+        name: &str,
+        ty: &str,
+        indexed: bool,
+        components: Vec<Param>,
+        internal_type: Option<InternalType>,
+    ) -> parser::Result<Self> {
+        Param::validate_fields(name, ty, !components.is_empty())?;
+        Ok(Self { name: name.into(), ty: ty.into(), indexed, components, internal_type })
+    }
+
     /// The internal type of the parameter.
     #[inline]
     pub const fn internal_type(&self) -> Option<&InternalType> {
@@ -333,7 +474,7 @@ impl EventParam {
     pub fn udt_specifier(&self) -> Option<TypeSpecifier<'_>> {
         // UDTs are more annoying to check for, so we reuse logic here.
         if !self.is_udt() {
-            return None
+            return None;
         }
         self.internal_type().and_then(|ty| ty.other_specifier())
     }
@@ -345,6 +486,7 @@ impl EventParam {
     pub fn struct_specifier(&self) -> Option<TypeSpecifier<'_>> {
         self.internal_type().and_then(|ty| ty.struct_specifier())
     }
+
     /// The enum specifier is a [`TypeSpecifier`] containing the enum name and
     /// any array sizes. It is computed from the `internal_type`. If this param
     /// is not a enum, this function will return `None`.
@@ -379,9 +521,29 @@ impl EventParam {
     #[inline]
     pub fn selector_type_raw(&self, s: &mut String) {
         if self.components.is_empty() {
-            s.push_str(&self.ty)
+            s.push_str(&self.ty);
         } else {
-            crate::utils::signature_raw("", &self.components, s)
+            crate::utils::params_abi_tuple(&self.components, s);
+            // checked during deserialization, but might be invalid from a user
+            if let Some(suffix) = self.ty.strip_prefix("tuple") {
+                s.push_str(suffix);
+            }
+        }
+    }
+
+    /// Formats the canonical type of this parameter into the given string including then names of
+    /// the params.
+    #[inline]
+    pub fn full_selector_type_raw(&self, s: &mut String) {
+        if self.components.is_empty() {
+            s.push_str(&self.ty);
+        } else {
+            s.push_str("tuple");
+            crate::utils::params_tuple(&self.components, s);
+            // checked during deserialization, but might be invalid from a user
+            if let Some(suffix) = self.ty.strip_prefix("tuple") {
+                s.push_str(suffix);
+            }
         }
     }
 
@@ -393,17 +555,20 @@ impl EventParam {
         if self.components.is_empty() {
             Cow::Borrowed(&self.ty)
         } else {
-            Cow::Owned(crate::utils::signature("", &self.components))
+            let mut s = String::with_capacity(self.components.len() * 32);
+            self.selector_type_raw(&mut s);
+            Cow::Owned(s)
         }
     }
 
+    #[inline]
     fn borrowed_internal_type(&self) -> Option<BorrowedInternalType<'_>> {
         self.internal_type().as_ref().map(|it| it.as_borrowed())
     }
 
     #[inline]
-    fn as_inner(&self) -> BorrowedParam<'_, Param> {
-        BorrowedParam {
+    fn as_inner(&self) -> BorrowedParamInner<'_> {
+        BorrowedParamInner {
             name: &self.name,
             ty: &self.ty,
             indexed: Some(self.indexed),
@@ -413,23 +578,85 @@ impl EventParam {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug)]
-#[serde(bound(deserialize = "<[T] as ToOwned>::Owned: Default + Deserialize<'de>"))]
-struct BorrowedParam<'a, T: Clone> {
+#[derive(Deserialize)]
+struct ParamInner {
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "type")]
+    ty: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    indexed: Option<bool>,
+    #[serde(rename = "internalType", default, skip_serializing_if = "Option::is_none")]
+    internal_type: Option<InternalType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    components: Vec<Param>,
+}
+
+impl Serialize for ParamInner {
+    #[inline]
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.as_borrowed().serialize(serializer)
+    }
+}
+
+impl ParamInner {
+    #[inline]
+    fn validate_fields<E: serde::de::Error>(&self) -> Result<(), E> {
+        self.as_borrowed().validate_fields()
+    }
+
+    #[inline]
+    fn as_borrowed(&self) -> BorrowedParamInner<'_> {
+        BorrowedParamInner {
+            name: &self.name,
+            ty: &self.ty,
+            indexed: self.indexed,
+            internal_type: self.internal_type.as_ref().map(InternalType::as_borrowed),
+            components: Cow::Borrowed(&self.components),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct BorrowedParamInner<'a> {
+    #[serde(default)]
     name: &'a str,
     #[serde(rename = "type")]
     ty: &'a str,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     indexed: Option<bool>,
-    #[serde(
-        rename = "internalType",
-        default,
-        skip_serializing_if = "Option::is_none",
-        borrow
-    )]
+    #[serde(rename = "internalType", default, skip_serializing_if = "Option::is_none")]
     internal_type: Option<BorrowedInternalType<'a>>,
     #[serde(default, skip_serializing_if = "<[_]>::is_empty")]
-    components: Cow<'a, [T]>,
+    components: Cow<'a, [Param]>,
+}
+
+impl BorrowedParamInner<'_> {
+    fn validate_fields<E: serde::de::Error>(&self) -> Result<(), E> {
+        validate_identifier(self.name)?;
+
+        // any components means type is "tuple" + maybe brackets, so we can skip
+        // parsing with TypeSpecifier
+        if self.components.is_empty() {
+            if parser::TypeSpecifier::parse(self.ty).is_err() {
+                return Err(E::invalid_value(
+                    Unexpected::Str(self.ty),
+                    &"a valid Solidity type specifier",
+                ));
+            }
+        } else {
+            // https://docs.soliditylang.org/en/latest/abi-spec.html#handling-tuple-types
+            // checking for "tuple" prefix should be enough
+            if !self.ty.starts_with("tuple") {
+                return Err(E::invalid_value(
+                    Unexpected::Str(self.ty),
+                    &"a string prefixed with `tuple`, optionally followed by a sequence of `[]` or `[k]` with integers `k`",
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -437,12 +664,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_complex_param() {
+    fn param_from_json() {
         let param = r#"{
             "internalType": "string",
             "name": "reason",
             "type": "string"
         }"#;
-        let _param = serde_json::from_str::<Param>(param).unwrap();
+        let expected = Param {
+            name: "reason".into(),
+            ty: "string".into(),
+            internal_type: Some(InternalType::Other { contract: None, ty: "string".into() }),
+            components: vec![],
+        };
+
+        assert_eq!(serde_json::from_str::<Param>(param).unwrap(), expected);
+
+        let param_value = serde_json::from_str::<serde_json::Value>(param).unwrap();
+        assert_eq!(serde_json::from_value::<Param>(param_value).unwrap(), expected);
+
+        #[cfg(feature = "std")]
+        {
+            let reader = std::io::Cursor::new(param);
+            assert_eq!(serde_json::from_reader::<_, Param>(reader).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn param_from_new() {
+        let param = Param::new("something", "string", vec![], None);
+        assert_eq!(
+            param,
+            Ok(Param {
+                name: "something".into(),
+                ty: "string".into(),
+                components: vec![],
+                internal_type: None,
+            })
+        );
+
+        let err_not_a_type = Param::new("something", "not a type", vec![], None);
+        assert!(err_not_a_type.is_err());
+
+        let err_not_tuple = Param::new("something", "string", vec![param.unwrap()], None);
+        assert!(err_not_tuple.is_err())
     }
 }

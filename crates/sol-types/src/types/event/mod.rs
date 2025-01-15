@@ -1,9 +1,9 @@
 use crate::{
-    token::{TokenSeq, WordToken},
-    Result, SolType, TokenType, Word,
+    abi::token::{Token, TokenSeq, WordToken},
+    Result, SolType, Word,
 };
 use alloc::vec::Vec;
-use alloy_primitives::{FixedBytes, B256};
+use alloy_primitives::{FixedBytes, Log, LogData, B256};
 
 mod topic;
 pub use topic::EventTopic;
@@ -13,11 +13,11 @@ pub use topic_list::TopicList;
 
 /// Solidity event.
 ///
-/// ### Implementer's Guide
+/// # Implementer's Guide
 ///
-/// We do not recommend implementing this trait directly. Instead, we recommend
-/// using the [`sol`][crate::sol] proc macro to parse a Solidity event
-/// definition.
+/// It should not be necessary to implement this trait manually. Instead, use
+/// the [`sol!`](crate::sol!) procedural macro to parse Solidity syntax into
+/// types that implement this trait.
 pub trait SolEvent: Sized {
     /// The underlying tuple type which represents this event's non-indexed
     /// parameters. These parameters are ABI encoded and included in the log
@@ -25,7 +25,7 @@ pub trait SolEvent: Sized {
     ///
     /// If this event has no non-indexed parameters, this will be the unit type
     /// `()`.
-    type DataTuple<'a>: SolType<TokenType<'a> = Self::DataToken<'a>>;
+    type DataTuple<'a>: SolType<Token<'a> = Self::DataToken<'a>>;
 
     /// The [`TokenSeq`] type corresponding to the tuple.
     type DataToken<'a>: TokenSeq<'a>;
@@ -47,16 +47,39 @@ pub trait SolEvent: Sized {
     ///
     /// For non-anonymous events, this will be the first topic (`topic0`).
     /// For anonymous events, this is unused, but is still present.
+    #[doc(alias = "SELECTOR")]
     const SIGNATURE_HASH: FixedBytes<32>;
 
     /// Whether the event is anonymous.
     const ANONYMOUS: bool;
 
     /// Convert decoded rust data to the event type.
+    ///
+    /// Does not check that `topics[0]` is the correct hash.
+    /// Use [`new_checked`](Self::new_checked) instead.
     fn new(
         topics: <Self::TopicList as SolType>::RustType,
         data: <Self::DataTuple<'_> as SolType>::RustType,
     ) -> Self;
+
+    /// Convert decoded rust data to the event type.
+    ///
+    /// Checks that `topics[0]` is the correct hash.
+    #[inline]
+    fn new_checked(
+        topics: <Self::TopicList as SolType>::RustType,
+        data: <Self::DataTuple<'_> as SolType>::RustType,
+    ) -> Result<Self> {
+        Self::check_signature(&topics).map(|()| Self::new(topics, data))
+    }
+
+    /// Check that the event's signature matches the given topics.
+    #[inline]
+    fn check_signature(topics: &<Self::TopicList as SolType>::RustType) -> Result<()> {
+        // Overridden for non-anonymous events in `sol!`.
+        let _ = topics;
+        Ok(())
+    }
 
     /// Tokenize the event's non-indexed parameters.
     fn tokenize_body(&self) -> Self::DataToken<'_>;
@@ -67,9 +90,9 @@ pub trait SolEvent: Sized {
 
     /// The size of the ABI-encoded dynamic data in bytes.
     #[inline]
-    fn encoded_size(&self) -> usize {
+    fn abi_encoded_size(&self) -> usize {
         if let Some(size) = <Self::DataTuple<'_> as SolType>::ENCODED_SIZE {
-            return size
+            return size;
         }
 
         self.tokenize_body().total_words() * Word::len_bytes()
@@ -78,14 +101,14 @@ pub trait SolEvent: Sized {
     /// ABI-encode the dynamic data of this event into the given buffer.
     #[inline]
     fn encode_data_to(&self, out: &mut Vec<u8>) {
-        out.reserve(self.encoded_size());
-        out.extend(crate::encode(&self.tokenize_body()));
+        out.reserve(self.abi_encoded_size());
+        out.extend(crate::abi::encode_sequence(&self.tokenize_body()));
     }
 
     /// ABI-encode the dynamic data of this event.
     #[inline]
     fn encode_data(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.encoded_size());
+        let mut out = Vec::new();
         self.encode_data_to(&mut out);
         out
     }
@@ -109,17 +132,27 @@ pub trait SolEvent: Sized {
 
     /// Encode the topics of this event into a fixed-size array.
     ///
-    /// # Panics
-    ///
-    /// This method will panic if `LEN` is not equal to
-    /// `Self::TopicList::COUNT`.
+    /// This method will not compile if `LEN` is not equal to `Self::TopicList::COUNT`.
     #[inline]
     fn encode_topics_array<const LEN: usize>(&self) -> [WordToken; LEN] {
-        // TODO: make this a compile-time error when `const` blocks are stable
-        assert_eq!(LEN, Self::TopicList::COUNT, "topic list length mismatch");
+        const { assert!(LEN == Self::TopicList::COUNT, "topic list length mismatch") };
         let mut out = [WordToken(B256::ZERO); LEN];
         self.encode_topics_raw(&mut out).unwrap();
         out
+    }
+
+    /// Encode this event to a [`LogData`].
+    fn encode_log_data(&self) -> LogData {
+        LogData::new_unchecked(
+            self.encode_topics().into_iter().map(Into::into).collect(),
+            self.encode_data().into(),
+        )
+    }
+
+    /// Transform ca [`Log`] containing this event into a [`Log`] containing
+    /// [`LogData`].
+    fn encode_log(log: &Log<Self>) -> Log<LogData> {
+        Log { address: log.address, data: log.data.encode_log_data() }
     }
 
     /// Decode the topics of this event from the given data.
@@ -132,23 +165,35 @@ pub trait SolEvent: Sized {
         <Self::TopicList as TopicList>::detokenize(topics)
     }
 
-    /// Decode the dynamic data of this event from the given buffer.
+    /// ABI-decodes the dynamic data of this event from the given buffer.
     #[inline]
-    fn decode_data<'a>(
+    fn abi_decode_data<'a>(
         data: &'a [u8],
         validate: bool,
     ) -> Result<<Self::DataTuple<'a> as SolType>::RustType> {
-        <Self::DataTuple<'a> as SolType>::decode(data, validate)
+        <Self::DataTuple<'a> as SolType>::abi_decode_sequence(data, validate)
     }
 
     /// Decode the event from the given log info.
-    fn decode_log<I, D>(topics: I, data: &[u8], validate: bool) -> Result<Self>
+    fn decode_raw_log<I, D>(topics: I, data: &[u8], validate: bool) -> Result<Self>
     where
         I: IntoIterator<Item = D>,
         D: Into<WordToken>,
     {
         let topics = Self::decode_topics(topics)?;
-        let body = Self::decode_data(data, validate)?;
+        // Check signature before decoding the data.
+        Self::check_signature(&topics)?;
+        let body = Self::abi_decode_data(data, validate)?;
         Ok(Self::new(topics, body))
+    }
+
+    /// Decode the event from the given log object.
+    fn decode_log_data(log: &LogData, validate: bool) -> Result<Self> {
+        Self::decode_raw_log(log.topics(), &log.data, validate)
+    }
+
+    /// Decode the event from the given log object.
+    fn decode_log(log: &Log, validate: bool) -> Result<Log<Self>> {
+        Self::decode_log_data(&log.data, validate).map(|data| Log { address: log.address, data })
     }
 }

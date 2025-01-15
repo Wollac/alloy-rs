@@ -1,23 +1,24 @@
 use crate::{
-    token::{PackedSeqToken, TokenSeq, WordToken},
-    Result, SolType, TokenType, Word,
+    abi::token::{PackedSeqToken, Token, TokenSeq, WordToken},
+    types::interface::RevertReason,
+    Result, SolType, Word,
 };
 use alloc::{string::String, vec::Vec};
 use alloy_primitives::U256;
 use core::{borrow::Borrow, fmt};
 
-/// Solidity Error (a tuple with a selector)
+/// A Solidity custom error.
 ///
-/// ### Implementer's Guide
+/// # Implementer's Guide
 ///
-/// We do not recommend implementing this trait directly. Instead, we recommend
-/// using the [`sol`][crate::sol] proc macro to parse a Solidity error
-/// definition.
+/// It should not be necessary to implement this trait manually. Instead, use
+/// the [`sol!`](crate::sol!) procedural macro to parse Solidity syntax into
+/// types that implement this trait.
 pub trait SolError: Sized {
     /// The underlying tuple type which represents the error's members.
     ///
     /// If the error has no arguments, this will be the unit type `()`
-    type Parameters<'a>: SolType<TokenType<'a> = Self::Token<'a>>;
+    type Parameters<'a>: SolType<Token<'a> = Self::Token<'a>>;
 
     /// The corresponding [`TokenSeq`] type.
     type Token<'a>: TokenSeq<'a>;
@@ -37,55 +38,72 @@ pub trait SolError: Sized {
     /// The size of the error params when encoded in bytes, **without** the
     /// selector.
     #[inline]
-    fn encoded_size(&self) -> usize {
+    fn abi_encoded_size(&self) -> usize {
         if let Some(size) = <Self::Parameters<'_> as SolType>::ENCODED_SIZE {
-            return size
+            return size;
         }
 
-        self.tokenize().total_words() * Word::len_bytes()
+        // `total_words` includes the first dynamic offset which we ignore.
+        let offset = <<Self::Parameters<'_> as SolType>::Token<'_> as Token>::DYNAMIC as usize * 32;
+        (self.tokenize().total_words() * Word::len_bytes()).saturating_sub(offset)
     }
 
     /// ABI decode this call's arguments from the given slice, **without** its
     /// selector.
     #[inline]
-    fn decode_raw(data: &[u8], validate: bool) -> Result<Self> {
-        <Self::Parameters<'_> as SolType>::decode(data, validate).map(Self::new)
+    fn abi_decode_raw(data: &[u8], validate: bool) -> Result<Self> {
+        <Self::Parameters<'_> as SolType>::abi_decode_sequence(data, validate).map(Self::new)
     }
 
     /// ABI decode this error's arguments from the given slice, **with** the
     /// selector.
     #[inline]
-    fn decode(data: &[u8], validate: bool) -> Result<Self> {
+    fn abi_decode(data: &[u8], validate: bool) -> Result<Self> {
         let data = data
             .strip_prefix(&Self::SELECTOR)
             .ok_or_else(|| crate::Error::type_check_fail_sig(data, Self::SIGNATURE))?;
-        Self::decode_raw(data, validate)
+        Self::abi_decode_raw(data, validate)
     }
 
     /// ABI encode the error to the given buffer **without** its selector.
     #[inline]
-    fn encode_raw(&self, out: &mut Vec<u8>) {
-        out.reserve(self.encoded_size());
-        out.extend(crate::encode(&self.tokenize()));
+    fn abi_encode_raw(&self, out: &mut Vec<u8>) {
+        out.reserve(self.abi_encoded_size());
+        out.extend(crate::abi::encode_sequence(&self.tokenize()));
     }
 
     /// ABI encode the error to the given buffer **with** its selector.
     #[inline]
-    fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + self.encoded_size());
+    fn abi_encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.abi_encoded_size());
         out.extend(&Self::SELECTOR);
-        self.encode_raw(&mut out);
+        self.abi_encode_raw(&mut out);
         out
     }
 }
 
-/// Represents a standard Solidity revert. These are thrown by
-/// `require(condition, reason)` statements in Solidity.
+/// Represents a standard Solidity revert. These are thrown by `revert(reason)`
+/// or `require(condition, reason)` statements in Solidity.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Revert {
     /// The reason string, provided by the Solidity contract.
     pub reason: String,
 }
+
+impl fmt::Debug for Revert {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Revert").field(&self.reason).finish()
+    }
+}
+
+impl fmt::Display for Revert {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("revert: ")?;
+        f.write_str(self.reason())
+    }
+}
+
+impl core::error::Error for Revert {}
 
 impl AsRef<str> for Revert {
     #[inline]
@@ -98,19 +116,6 @@ impl Borrow<str> for Revert {
     #[inline]
     fn borrow(&self) -> &str {
         &self.reason
-    }
-}
-
-impl fmt::Debug for Revert {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Revert").field(&self.reason).finish()
-    }
-}
-
-impl fmt::Display for Revert {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Revert: ")?;
-        f.write_str(&self.reason)
     }
 }
 
@@ -131,9 +136,7 @@ impl From<String> for Revert {
 impl From<&str> for Revert {
     #[inline]
     fn from(value: &str) -> Self {
-        Self {
-            reason: value.into(),
-        }
+        Self { reason: value.into() }
     }
 }
 
@@ -155,8 +158,20 @@ impl SolError for Revert {
     }
 
     #[inline]
-    fn encoded_size(&self) -> usize {
+    fn abi_encoded_size(&self) -> usize {
         64 + crate::utils::next_multiple_of_32(self.reason.len())
+    }
+}
+
+impl Revert {
+    /// Returns the revert reason string, or `"<empty>"` if empty.
+    #[inline]
+    pub fn reason(&self) -> &str {
+        if self.reason.is_empty() {
+            "<empty>"
+        } else {
+            &self.reason
+        }
     }
 }
 
@@ -190,44 +205,17 @@ impl Borrow<U256> for Panic {
     }
 }
 
-impl fmt::Debug for Panic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut debug = f.debug_tuple("Panic");
-        if let Some(kind) = self.kind() {
-            debug.field(&kind);
-        } else {
-            debug.field(&self.code);
-        }
-        debug.finish()
-    }
-}
-
-impl fmt::Display for Panic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Panic: ")?;
-        if let Some(kind) = self.kind() {
-            f.write_str(kind.as_str())
-        } else {
-            write!(f, "unknown code: {}", self.code)
-        }
-    }
-}
-
 impl From<PanicKind> for Panic {
     #[inline]
     fn from(value: PanicKind) -> Self {
-        Self {
-            code: U256::from(value as u64),
-        }
+        Self { code: U256::from(value as u64) }
     }
 }
 
 impl From<u64> for Panic {
     #[inline]
     fn from(value: u64) -> Self {
-        Self {
-            code: U256::from(value),
-        }
+        Self { code: U256::from(value) }
     }
 }
 
@@ -244,6 +232,38 @@ impl From<U256> for Panic {
         Self { code: value }
     }
 }
+
+impl fmt::Debug for Panic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_tuple("Panic");
+        if let Some(kind) = self.kind() {
+            debug.field(&kind);
+        } else {
+            debug.field(&self.code);
+        }
+        debug.finish()
+    }
+}
+
+impl fmt::Display for Panic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("panic: ")?;
+
+        let kind = self.kind();
+        let msg = kind.map(PanicKind::as_str).unwrap_or("unknown code");
+        f.write_str(msg)?;
+
+        f.write_str(" (0x")?;
+        if let Some(kind) = kind {
+            write!(f, "{:02x}", kind as u32)
+        } else {
+            write!(f, "{:x}", self.code)
+        }?;
+        f.write_str(")")
+    }
+}
+
+impl core::error::Error for Panic {}
 
 impl SolError for Panic {
     type Parameters<'a> = (crate::sol_data::Uint<256>,);
@@ -263,7 +283,7 @@ impl SolError for Panic {
     }
 
     #[inline]
-    fn encoded_size(&self) -> usize {
+    fn abi_encoded_size(&self) -> usize {
         32
     }
 }
@@ -275,9 +295,7 @@ impl Panic {
     /// [ref]: https://docs.soliditylang.org/en/latest/control-structures.html#panic-via-assert-and-error-via-require
     pub fn kind(&self) -> Option<PanicKind> {
         // use try_from to avoid copying by using the `&` impl
-        u32::try_from(&self.code)
-            .ok()
-            .and_then(PanicKind::from_number)
+        u32::try_from(&self.code).ok().and_then(PanicKind::from_number)
     }
 }
 
@@ -288,6 +306,7 @@ impl Panic {
 /// [Solidity definition]: https://github.com/ethereum/solidity/blob/9eaa5cebdb1458457135097efdca1a3573af17c8/libsolutil/ErrorCodes.h#L25-L37
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u32)]
+#[non_exhaustive]
 pub enum PanicKind {
     // Docs extracted from the Solidity definition and documentation, linked above.
     /// Generic / unspecified error.
@@ -383,35 +402,49 @@ impl PanicKind {
     }
 }
 
+/// Decodes and retrieves the reason for a revert from the provided output data.
+///
+/// This function attempts to decode the provided output data as a generic contract error
+/// or a UTF-8 string (for Vyper reverts) using the `RevertReason::decode` method.
+///
+/// If successful, it returns the decoded revert reason wrapped in an `Option`.
+///
+/// If both attempts fail, it returns `None`.
+pub fn decode_revert_reason(out: &[u8]) -> Option<String> {
+    RevertReason::decode(out).map(|x| x.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::keccak256;
+    use crate::{sol, types::interface::SolInterface};
+    use alloc::string::ToString;
+    use alloy_primitives::{address, hex, keccak256};
 
     #[test]
-    fn test_revert_encoding() {
+    fn revert_encoding() {
         let revert = Revert::from("test");
-        let encoded = revert.encode();
-        let decoded = Revert::decode(&encoded, true).unwrap();
-        assert_eq!(encoded.len(), revert.encoded_size() + 4);
+        let encoded = revert.abi_encode();
+        let decoded = Revert::abi_decode(&encoded, true).unwrap();
+        assert_eq!(encoded.len(), revert.abi_encoded_size() + 4);
         assert_eq!(encoded.len(), 100);
         assert_eq!(revert, decoded);
     }
 
     #[test]
-    fn test_panic_encoding() {
+    fn panic_encoding() {
         let panic = Panic { code: U256::ZERO };
         assert_eq!(panic.kind(), Some(PanicKind::Generic));
-        let encoded = panic.encode();
-        let decoded = Panic::decode(&encoded, true).unwrap();
+        let encoded = panic.abi_encode();
+        let decoded = Panic::abi_decode(&encoded, true).unwrap();
 
-        assert_eq!(encoded.len(), panic.encoded_size() + 4);
+        assert_eq!(encoded.len(), panic.abi_encoded_size() + 4);
         assert_eq!(encoded.len(), 36);
         assert_eq!(panic, decoded);
     }
 
     #[test]
-    fn test_selectors() {
+    fn selectors() {
         assert_eq!(
             Revert::SELECTOR,
             &keccak256(b"Error(string)")[..4],
@@ -421,6 +454,64 @@ mod tests {
             Panic::SELECTOR,
             &keccak256(b"Panic(uint256)")[..4],
             "Panic selector is incorrect"
+        );
+    }
+
+    #[test]
+    fn decode_solidity_revert_reason() {
+        let revert = Revert::from("test_revert_reason");
+        let encoded = revert.abi_encode();
+        let decoded = decode_revert_reason(&encoded).unwrap();
+        assert_eq!(decoded, revert.to_string());
+    }
+
+    #[test]
+    fn decode_uniswap_revert() {
+        // Solc 0.5.X/0.5.16 adds a random 0x80 byte which makes reserialization check fail.
+        // https://github.com/Uniswap/v2-core/blob/ee547b17853e71ed4e0101ccfd52e70d5acded58/contracts/UniswapV2Pair.sol#L178
+        // https://github.com/paradigmxyz/evm-inspectors/pull/12
+        let bytes = hex!("08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000024556e697377617056323a20494e53554646494349454e545f494e5055545f414d4f554e5400000000000000000000000000000000000000000000000000000080");
+
+        Revert::abi_decode(&bytes, true).unwrap_err();
+
+        let decoded = Revert::abi_decode(&bytes, false).unwrap();
+        assert_eq!(decoded.reason, "UniswapV2: INSUFFICIENT_INPUT_AMOUNT");
+
+        let decoded = decode_revert_reason(&bytes).unwrap();
+        assert_eq!(decoded, "revert: UniswapV2: INSUFFICIENT_INPUT_AMOUNT");
+    }
+
+    #[test]
+    fn decode_random_revert_reason() {
+        let revert_reason = String::from("test_revert_reason");
+        let decoded = decode_revert_reason(revert_reason.as_bytes()).unwrap();
+        assert_eq!(decoded, "test_revert_reason");
+    }
+
+    #[test]
+    fn decode_non_utf8_revert_reason() {
+        let revert_reason = [0xFF];
+        let decoded = decode_revert_reason(&revert_reason);
+        assert_eq!(decoded, None);
+    }
+
+    // https://github.com/alloy-rs/core/issues/382
+    #[test]
+    fn decode_solidity_no_interface() {
+        sol! {
+            interface C {
+                #[derive(Debug, PartialEq)]
+                error SenderAddressError(address);
+            }
+        }
+
+        let data = hex!("8758782b000000000000000000000000a48388222c7ee7daefde5d0b9c99319995c4a990");
+        assert_eq!(decode_revert_reason(&data), None);
+
+        let C::CErrors::SenderAddressError(decoded) = C::CErrors::abi_decode(&data, true).unwrap();
+        assert_eq!(
+            decoded,
+            C::SenderAddressError { _0: address!("0xa48388222c7ee7daefde5d0b9c99319995c4a990") }
         );
     }
 }

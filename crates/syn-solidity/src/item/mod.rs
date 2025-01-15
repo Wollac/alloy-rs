@@ -1,15 +1,16 @@
-use crate::{kw, variable::VariableDefinition, SolIdent};
+use crate::{kw, variable::VariableDefinition, SolIdent, Spanned};
 use proc_macro2::Span;
+use std::fmt;
 use syn::{
     parse::{Parse, ParseStream},
     Attribute, Result, Token,
 };
 
 mod contract;
-pub use contract::ItemContract;
+pub use contract::{ContractKind, Inheritance, ItemContract};
 
 mod r#enum;
-pub use r#enum::ItemEnum;
+pub use r#enum::{ItemEnum, Variant};
 
 mod error;
 pub use error::ItemError;
@@ -18,7 +19,7 @@ mod event;
 pub use event::{EventParameter, ItemEvent};
 
 mod function;
-pub use function::{ItemFunction, Returns};
+pub use function::{FunctionBody, FunctionKind, ItemFunction, Returns};
 
 mod import;
 pub use import::{
@@ -40,7 +41,7 @@ pub use using::{UserDefinableOperator, UsingDirective, UsingList, UsingListItem,
 /// An AST item. A more expanded version of a [Solidity source unit][ref].
 ///
 /// [ref]: https://docs.soliditylang.org/en/latest/grammar.html#a4.SolidityParser.sourceUnit
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Item {
     /// A contract, abstract contract, interface, or library definition:
     /// `contract Foo is Bar, Baz { ... }`
@@ -79,12 +80,49 @@ pub enum Item {
     Variable(VariableDefinition),
 }
 
+impl fmt::Display for Item {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Contract(item) => item.fmt(f),
+            Self::Enum(item) => item.fmt(f),
+            Self::Error(item) => item.fmt(f),
+            Self::Event(item) => item.fmt(f),
+            Self::Function(item) => item.fmt(f),
+            Self::Import(item) => item.fmt(f),
+            Self::Pragma(item) => item.fmt(f),
+            Self::Struct(item) => item.fmt(f),
+            Self::Udt(item) => item.fmt(f),
+            Self::Using(item) => item.fmt(f),
+            Self::Variable(item) => item.fmt(f),
+        }
+    }
+}
+
+impl fmt::Debug for Item {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Item::")?;
+        match self {
+            Self::Contract(item) => item.fmt(f),
+            Self::Enum(item) => item.fmt(f),
+            Self::Error(item) => item.fmt(f),
+            Self::Event(item) => item.fmt(f),
+            Self::Function(item) => item.fmt(f),
+            Self::Import(item) => item.fmt(f),
+            Self::Pragma(item) => item.fmt(f),
+            Self::Struct(item) => item.fmt(f),
+            Self::Udt(item) => item.fmt(f),
+            Self::Using(item) => item.fmt(f),
+            Self::Variable(item) => item.fmt(f),
+        }
+    }
+}
+
 impl Parse for Item {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut attrs = input.call(Attribute::parse_outer)?;
 
         let lookahead = input.lookahead1();
-        let mut item = if function::FunctionKind::peek(&lookahead) {
+        let mut item = if FunctionKind::peek(&lookahead) {
             input.parse().map(Self::Function)
         } else if lookahead.peek(Token![struct]) {
             input.parse().map(Self::Struct)
@@ -92,7 +130,7 @@ impl Parse for Item {
             input.parse().map(Self::Event)
         } else if lookahead.peek(kw::error) {
             input.parse().map(Self::Error)
-        } else if contract::ContractKind::peek(&lookahead) {
+        } else if ContractKind::peek(&lookahead) {
             input.parse().map(Self::Contract)
         } else if lookahead.peek(Token![enum]) {
             input.parse().map(Self::Enum)
@@ -117,8 +155,8 @@ impl Parse for Item {
     }
 }
 
-impl Item {
-    pub fn span(&self) -> Span {
+impl Spanned for Item {
+    fn span(&self) -> Span {
         match self {
             Self::Contract(contract) => contract.span(),
             Self::Enum(enumm) => enumm.span(),
@@ -134,7 +172,7 @@ impl Item {
         }
     }
 
-    pub fn set_span(&mut self, span: Span) {
+    fn set_span(&mut self, span: Span) {
         match self {
             Self::Contract(contract) => contract.set_span(span),
             Self::Enum(enumm) => enumm.set_span(span),
@@ -149,23 +187,24 @@ impl Item {
             Self::Variable(variable) => variable.set_span(span),
         }
     }
+}
 
+impl Item {
     pub fn name(&self) -> Option<&SolIdent> {
         match self {
             Self::Contract(ItemContract { name, .. })
             | Self::Enum(ItemEnum { name, .. })
             | Self::Error(ItemError { name, .. })
             | Self::Event(ItemEvent { name, .. })
-            | Self::Function(ItemFunction {
-                name: Some(name), ..
-            })
+            | Self::Function(ItemFunction { name: Some(name), .. })
             | Self::Struct(ItemStruct { name, .. })
-            | Self::Udt(ItemUdt { name, .. }) => Some(name),
+            | Self::Udt(ItemUdt { name, .. })
+            | Self::Variable(VariableDefinition { name, .. }) => Some(name),
             _ => None,
         }
     }
 
-    fn replace_attrs(&mut self, src: Vec<Attribute>) -> Vec<Attribute> {
+    pub fn attrs(&self) -> Option<&Vec<Attribute>> {
         match self {
             Self::Contract(ItemContract { attrs, .. })
             | Self::Function(ItemFunction { attrs, .. })
@@ -173,8 +212,31 @@ impl Item {
             | Self::Error(ItemError { attrs, .. })
             | Self::Event(ItemEvent { attrs, .. })
             | Self::Struct(ItemStruct { attrs, .. })
-            | Self::Udt(ItemUdt { attrs, .. }) => std::mem::replace(attrs, src),
-            _ => vec![],
+            | Self::Udt(ItemUdt { attrs, .. })
+            | Self::Variable(VariableDefinition { attrs, .. }) => Some(attrs),
+            Self::Import(_) | Self::Pragma(_) | Self::Using(_) => None,
+        }
+    }
+
+    pub fn attrs_mut(&mut self) -> Option<&mut Vec<Attribute>> {
+        match self {
+            Self::Contract(ItemContract { attrs, .. })
+            | Self::Function(ItemFunction { attrs, .. })
+            | Self::Enum(ItemEnum { attrs, .. })
+            | Self::Error(ItemError { attrs, .. })
+            | Self::Event(ItemEvent { attrs, .. })
+            | Self::Struct(ItemStruct { attrs, .. })
+            | Self::Udt(ItemUdt { attrs, .. })
+            | Self::Variable(VariableDefinition { attrs, .. }) => Some(attrs),
+            Self::Import(_) | Self::Pragma(_) | Self::Using(_) => None,
+        }
+    }
+
+    fn replace_attrs(&mut self, src: Vec<Attribute>) -> Vec<Attribute> {
+        if let Some(attrs) = self.attrs_mut() {
+            std::mem::replace(attrs, src)
+        } else {
+            Vec::new()
         }
     }
 }
